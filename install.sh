@@ -80,13 +80,13 @@ log "Installing npm dependencies..."
 npm ci --silent 2>/dev/null || npm install --silent
 
 log "Generating Prisma client..."
-npx prisma generate --schema="${APP_DIR}/prisma/schema.prisma"
+cd "${APP_DIR}" && npx prisma generate --schema ./prisma/schema.prisma
 
 log "Running database migrations..."
-npx prisma migrate deploy --schema="${APP_DIR}/prisma/schema.prisma"
+cd "${APP_DIR}" && npx prisma migrate deploy --schema ./prisma/schema.prisma
 
 log "Building application..."
-npx nest build
+cd "${APP_DIR}" && npx nest build
 
 # ───────────────────────── HAProxy initial config ─────────
 if [[ ! -f /etc/haproxy/haproxy.cfg.original ]]; then
