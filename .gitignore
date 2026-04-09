@@ -3,7 +3,5 @@ dist
 *.db
 
 .env
-prisma.config.ts
-
 /generated/prisma
 .claude
