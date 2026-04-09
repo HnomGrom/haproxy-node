@@ -4,16 +4,16 @@ export declare class ServersController {
     private readonly serversService;
     constructor(serversService: ServersService);
     findAll(): Promise<{
-        id: number;
         name: string;
+        id: number;
         ip: string;
         backendPort: number;
         frontendPort: number;
         createdAt: Date;
     }[]>;
     create(dto: CreateServerDto): Promise<{
-        id: number;
         name: string;
+        id: number;
         ip: string;
         backendPort: number;
         frontendPort: number;
