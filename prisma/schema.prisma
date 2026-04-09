@@ -1,0 +1,17 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Server {
+  id           Int      @id @default(autoincrement())
+  name         String   @unique
+  ip           String
+  backendPort  Int
+  frontendPort Int      @unique
+  createdAt    DateTime @default(now())
+}

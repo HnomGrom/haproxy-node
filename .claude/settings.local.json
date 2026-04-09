@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npx prisma:*)",
+      "Bash(npx nest:*)",
+      "Bash(ls \"C:/Users/Admin/Desktop/haproxy-node/generated/prisma/index\"*)"
+    ]
+  }
+}
