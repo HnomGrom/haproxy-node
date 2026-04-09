@@ -4,7 +4,7 @@ set -euo pipefail
 APP_DIR="/opt/haproxy-node"
 REPO_URL="https://github.com/HnomGrom/node.git"
 SERVICE_NAME="haproxy-node"
-NODE_MAJOR=20
+NODE_MAJOR=22
 
 # ───────────────────────── Colors ─────────────────────────
 RED='\033[0;31m'
@@ -80,10 +80,10 @@ log "Installing npm dependencies..."
 npm ci --silent 2>/dev/null || npm install --silent
 
 log "Generating Prisma client..."
-npx prisma generate
+npx prisma generate --schema="${APP_DIR}/prisma/schema.prisma"
 
 log "Running database migrations..."
-npx prisma migrate deploy
+npx prisma migrate deploy --schema="${APP_DIR}/prisma/schema.prisma"
 
 log "Building application..."
 npx nest build
