@@ -16,8 +16,8 @@ export class ServersService {
     private readonly haproxy: HaproxyService,
     private readonly config: ConfigService,
   ) {
-    this.portMin = this.config.get<number>('FRONTEND_PORT_MIN', 10000);
-    this.portMax = this.config.get<number>('FRONTEND_PORT_MAX', 65000);
+    this.portMin = Number(this.config.get('FRONTEND_PORT_MIN', 10000));
+    this.portMax = Number(this.config.get('FRONTEND_PORT_MAX', 65000));
   }
 
   async findAll(): Promise<Server[]> {
