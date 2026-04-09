@@ -90,7 +90,7 @@ log "Building application..."
 cd "${APP_DIR}"
 rm -rf "${APP_DIR}/dist"
 ./node_modules/.bin/tsc -p tsconfig.build.json || err "TypeScript compilation failed"
-[[ -f "${APP_DIR}/dist/main.js" ]] || err "Build failed — dist/main.js not found"
+[[ -f "${APP_DIR}/dist/src/main.js" ]] || err "Build failed — dist/src/main.js not found"
 log "Build successful"
 
 # ───────────────────────── HAProxy initial config ─────────
@@ -130,7 +130,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${APP_DIR}
-ExecStart=$(which node) ${APP_DIR}/dist/main.js
+ExecStart=$(which node) ${APP_DIR}/dist/src/main.js
 Restart=on-failure
 RestartSec=5
 EnvironmentFile=${APP_DIR}/.env
