@@ -12,6 +12,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.ServersService = void 0;
 const common_1 = require("@nestjs/common");
 const config_1 = require("@nestjs/config");
+const crypto_1 = require("crypto");
 const prisma_service_1 = require("../prisma/prisma.service");
 const haproxy_service_1 = require("../haproxy/haproxy.service");
 let ServersService = class ServersService {
@@ -27,15 +28,10 @@ let ServersService = class ServersService {
     }
     async create(dto) {
         const frontendPort = await this.allocatePort();
-        const existing = await this.prisma.server.findUnique({
-            where: { name: dto.name },
-        });
-        if (existing) {
-            throw new common_1.BadRequestException(`Server "${dto.name}" already exists`);
-        }
+        const name = 'node_' + (0, crypto_1.randomBytes)(4).toString('hex');
         const server = await this.prisma.server.create({
             data: {
-                name: dto.name,
+                name,
                 ip: dto.ip,
                 backendPort: dto.backendPort,
                 frontendPort,

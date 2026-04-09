@@ -1,10 +1,6 @@
-import { IsIP, IsInt, IsString, Max, Min, MinLength } from 'class-validator';
+import { IsIP, IsInt, Max, Min } from 'class-validator';
 
 export class CreateServerDto {
-  @IsString()
-  @MinLength(1)
-  name: string;
-
   @IsIP()
   ip: string;
 

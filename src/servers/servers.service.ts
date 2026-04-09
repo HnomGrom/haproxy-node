@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { randomBytes } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { HaproxyService } from '../haproxy/haproxy.service';
 import { CreateServerDto } from './dto/create-server.dto';
@@ -25,17 +26,11 @@ export class ServersService {
 
   async create(dto: CreateServerDto): Promise<Server> {
     const frontendPort = await this.allocatePort();
-
-    const existing = await this.prisma.server.findUnique({
-      where: { name: dto.name },
-    });
-    if (existing) {
-      throw new BadRequestException(`Server "${dto.name}" already exists`);
-    }
+    const name = 'node_' + randomBytes(4).toString('hex');
 
     const server = await this.prisma.server.create({
       data: {
-        name: dto.name,
+        name,
         ip: dto.ip,
         backendPort: dto.backendPort,
         frontendPort,
