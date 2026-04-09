@@ -84,7 +84,7 @@ log "Generating Prisma client..."
 cd "${APP_DIR}" && npx prisma generate --schema ./prisma/schema.prisma
 
 log "Running database migrations..."
-cd "${APP_DIR}" && npx prisma migrate deploy --schema ./prisma/schema.prisma
+cd "${APP_DIR}" && DATABASE_URL="file:./dev.db" npx prisma migrate deploy --schema ./prisma/schema.prisma
 
 log "Building application..."
 cd "${APP_DIR}" && npx nest build
