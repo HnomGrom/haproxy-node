@@ -78,7 +78,7 @@ EOF
 
 # ───────────────────────── Install & build ────────────────
 log "Installing npm dependencies..."
-cd "${APP_DIR}" && npm install
+cd "${APP_DIR}" && NODE_ENV=development npm install
 
 log "Generating Prisma client..."
 cd "${APP_DIR}" && npx prisma generate
@@ -87,7 +87,7 @@ log "Running database migrations..."
 cd "${APP_DIR}" && npx prisma migrate deploy
 
 log "Building application..."
-cd "${APP_DIR}" && npx nest build
+cd "${APP_DIR}" && ./node_modules/.bin/nest build
 
 [[ -f "${APP_DIR}/dist/main.js" ]] || err "Build failed — dist/main.js not found"
 
