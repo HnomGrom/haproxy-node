@@ -87,9 +87,11 @@ log "Running database migrations..."
 cd "${APP_DIR}" && npx prisma migrate deploy
 
 log "Building application..."
-cd "${APP_DIR}" && ./node_modules/.bin/nest build
-
+cd "${APP_DIR}"
+rm -rf "${APP_DIR}/dist"
+./node_modules/.bin/tsc -p tsconfig.build.json || err "TypeScript compilation failed"
 [[ -f "${APP_DIR}/dist/main.js" ]] || err "Build failed — dist/main.js not found"
+log "Build successful"
 
 # ───────────────────────── HAProxy initial config ─────────
 if [[ ! -f /etc/haproxy/haproxy.cfg.original ]]; then
