@@ -78,7 +78,7 @@ EOF
 
 # ───────────────────────── Install & build ────────────────
 log "Installing npm dependencies..."
-npm ci --silent 2>/dev/null || npm install --silent
+cd "${APP_DIR}" && npm install
 
 log "Generating Prisma client..."
 cd "${APP_DIR}" && npx prisma generate
@@ -88,6 +88,8 @@ cd "${APP_DIR}" && npx prisma migrate deploy
 
 log "Building application..."
 cd "${APP_DIR}" && npx nest build
+
+[[ -f "${APP_DIR}/dist/main.js" ]] || err "Build failed — dist/main.js not found"
 
 # ───────────────────────── HAProxy initial config ─────────
 if [[ ! -f /etc/haproxy/haproxy.cfg.original ]]; then
