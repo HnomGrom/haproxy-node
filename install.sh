@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_DIR="/opt/haproxy-node"
-REPO_URL="https://github.com/HnomGrom/node.git"
+REPO_URL="https://github.com/HnomGrom/haproxy-node.git"
 SERVICE_NAME="haproxy-node"
 NODE_MAJOR=22
 
@@ -54,12 +54,13 @@ else
 fi
 
 # ───────────────────────── Clone project ──────────────────
-if [[ -d "$APP_DIR" ]]; then
+if [[ -d "$APP_DIR/.git" ]]; then
   log "Updating existing installation..."
   cd "$APP_DIR"
   git pull --ff-only || true
 else
   log "Cloning repository..."
+  rm -rf "$APP_DIR"
   git clone "$REPO_URL" "$APP_DIR"
   cd "$APP_DIR"
 fi
