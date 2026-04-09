@@ -6,3 +6,4 @@ dist
 prisma.config.ts
 
 /generated/prisma
+.claude
