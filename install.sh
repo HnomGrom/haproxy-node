@@ -37,6 +37,9 @@ PORT_MIN="${PORT_MIN:-10000}"
 read -rp "Frontend port range max [65000]: " PORT_MAX
 PORT_MAX="${PORT_MAX:-65000}"
 
+read -rp "Fallback error page port [59999]: " FALLBACK_PORT
+FALLBACK_PORT="${FALLBACK_PORT:-59999}"
+
 # ───────────────────────── Install system deps ────────────
 log "Updating packages..."
 apt-get update -qq
@@ -74,6 +77,8 @@ HAPROXY_CONFIG_PATH="/etc/haproxy/haproxy.cfg"
 PORT=${API_PORT}
 FRONTEND_PORT_MIN=${PORT_MIN}
 FRONTEND_PORT_MAX=${PORT_MAX}
+FALLBACK_PORT=${FALLBACK_PORT}
+ERROR_PAGE_PATH="/etc/haproxy/errors/503.html"
 EOF
 
 # ───────────────────────── Install & build ────────────────
@@ -93,6 +98,11 @@ rm -rf "${APP_DIR}/dist"
 [[ -f "${APP_DIR}/dist/src/main.js" ]] || err "Build failed — dist/src/main.js not found"
 log "Build successful"
 
+# ───────────────────────── Error page ─────────────────────
+log "Installing error page..."
+mkdir -p /etc/haproxy/errors
+cp "${APP_DIR}/src/haproxy/error-pages/503.html" /etc/haproxy/errors/503.html
+
 # ───────────────────────── HAProxy initial config ─────────
 if [[ ! -f /etc/haproxy/haproxy.cfg.original ]]; then
   log "Backing up original HAProxy config..."
@@ -100,7 +110,7 @@ if [[ ! -f /etc/haproxy/haproxy.cfg.original ]]; then
 fi
 
 log "Writing initial HAProxy config..."
-cat > /etc/haproxy/haproxy.cfg <<'HAPCFG'
+cat > /etc/haproxy/haproxy.cfg <<HAPCFG
 global
     log /dev/log local0
     maxconn 50000
@@ -115,10 +125,40 @@ defaults
     timeout tunnel  1h
     timeout client-fin 30s
     timeout server-fin 30s
+
+frontend fallback_error
+    bind *:${FALLBACK_PORT}
+    mode http
+    timeout client 10s
+    http-request return status 503 content-type "text/html; charset=utf-8" file /etc/haproxy/errors/503.html
 HAPCFG
 
 systemctl enable haproxy
 systemctl restart haproxy
+
+# ───────────────────────── iptables fallback rules ────────
+log "Setting up iptables fallback rules..."
+iptables -t nat -N HAPROXY_FALLBACK 2>/dev/null || iptables -t nat -F HAPROXY_FALLBACK
+
+# Protect system ports
+iptables -t nat -A HAPROXY_FALLBACK -p tcp --dport 22 -j RETURN
+iptables -t nat -A HAPROXY_FALLBACK -p tcp --dport ${API_PORT} -j RETURN
+iptables -t nat -A HAPROXY_FALLBACK -p tcp --dport ${FALLBACK_PORT} -j RETURN
+
+# Redirect everything else to fallback
+iptables -t nat -A HAPROXY_FALLBACK -p tcp -j REDIRECT --to-port ${FALLBACK_PORT}
+
+# Attach to PREROUTING if not already
+if ! iptables -t nat -S PREROUTING | grep -q "HAPROXY_FALLBACK"; then
+  iptables -t nat -A PREROUTING -p tcp -j HAPROXY_FALLBACK
+fi
+
+# Persist iptables rules across reboots
+if command -v netfilter-persistent &>/dev/null; then
+  netfilter-persistent save
+elif command -v iptables-save &>/dev/null; then
+  iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+fi
 
 # ───────────────────────── Systemd service ────────────────
 log "Creating systemd service..."

@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Server } from '../../generated/prisma/client';
+import { IptablesService } from '../iptables/iptables.service';
 import { exec } from 'child_process';
 import { readFile, writeFile } from 'fs/promises';
 import { promisify } from 'util';
@@ -11,9 +12,19 @@ const execAsync = promisify(exec);
 export class HaproxyService {
   private readonly logger = new Logger(HaproxyService.name);
   private readonly configPath: string;
+  private readonly fallbackPort: number;
+  private readonly errorPagePath: string;
 
-  constructor(private readonly config: ConfigService) {
+  constructor(
+    private readonly config: ConfigService,
+    private readonly iptables: IptablesService,
+  ) {
     this.configPath = this.config.get<string>('HAPROXY_CONFIG_PATH');
+    this.fallbackPort = Number(this.config.get('FALLBACK_PORT', 59999));
+    this.errorPagePath = this.config.get<string>(
+      'ERROR_PAGE_PATH',
+      '/etc/haproxy/errors/503.html',
+    );
   }
 
   buildConfig(servers: Server[]): string {
@@ -55,6 +66,16 @@ export class HaproxyService {
       );
     }
 
+    // Catch-all HTTP frontend for unknown ports (iptables redirects here)
+    lines.push(
+      '',
+      'frontend fallback_error',
+      `    bind *:${this.fallbackPort}`,
+      '    mode http',
+      '    timeout client 10s',
+      `    http-request return status 503 content-type "text/html; charset=utf-8" file ${this.errorPagePath}`,
+    );
+
     return lines.join('\n') + '\n';
   }
 
@@ -83,6 +104,17 @@ export class HaproxyService {
       }
 
       throw error;
+    }
+
+    // Apply iptables rules (non-critical — don't rollback HAProxy if this fails)
+    try {
+      const serverPorts = servers.map((s) => s.frontendPort);
+      await this.iptables.applyRules(serverPorts);
+    } catch (error) {
+      this.logger.error(
+        'iptables rules failed — HAProxy is running but fallback redirect is not active',
+        error,
+      );
     }
   }
 }
