@@ -12,12 +12,18 @@ const execAsync = promisify(exec);
 export class HaproxyService {
   private readonly logger = new Logger(HaproxyService.name);
   private readonly configPath: string;
+  private readonly allowedSniList: string[];
 
   constructor(
     private readonly config: ConfigService,
     private readonly iptables: IptablesService,
   ) {
     this.configPath = this.config.get<string>('HAPROXY_CONFIG_PATH');
+    const rawSni = this.config.get<string>('ALLOWED_SNI', '') || '';
+    this.allowedSniList = rawSni
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
   }
 
   buildConfig(servers: Server[]): string {
@@ -48,8 +54,13 @@ export class HaproxyService {
       '    stick-table type ipv6 size 1m expire 30m store conn_rate(10s),conn_cur,sess_rate(10s),gpc0,gpc0_rate(1m)',
     ];
 
+    const sniAcl =
+      this.allowedSniList.length > 0
+        ? `{ req.ssl_sni -i ${this.allowedSniList.join(' ')} }`
+        : null;
+
     for (const server of servers) {
-      lines.push(
+      const frontendLines = [
         '',
         `frontend ${server.name}_in`,
         `    bind *:${server.frontendPort}`,
@@ -62,8 +73,17 @@ export class HaproxyService {
         '    tcp-request inspect-delay 3s',
         '    tcp-request content reject if !{ req.ssl_hello_type 1 }',
         '    tcp-request content sc-inc-gpc0(0) if !{ req.ssl_hello_type 1 }',
-        `    default_backend ${server.name}`,
-      );
+      ];
+
+      if (sniAcl) {
+        frontendLines.push(
+          `    tcp-request content reject unless ${sniAcl}`,
+          `    tcp-request content sc-inc-gpc0(0) unless ${sniAcl}`,
+        );
+      }
+
+      frontendLines.push(`    default_backend ${server.name}`);
+      lines.push(...frontendLines);
     }
 
     for (const server of servers) {
