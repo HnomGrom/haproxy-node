@@ -83,12 +83,19 @@ export class HaproxyService {
     }
 
     // Catch-all HTTP frontend for unknown ports (iptables redirects here)
+    // Rate-limited so port scanners and non-HTTP garbage get banned globally
     lines.push(
       '',
       'frontend fallback_error',
       `    bind *:${this.fallbackPort}`,
       '    mode http',
-      '    timeout client 10s',
+      '    timeout client 5s',
+      '    tcp-request connection track-sc0 src table abuse_table',
+      '    tcp-request connection reject if { sc0_get_gpc0 gt 0 }',
+      '    tcp-request connection reject if { sc0_conn_rate gt 50 }',
+      '    tcp-request inspect-delay 2s',
+      '    tcp-request content sc-inc-gpc0(0) if !HTTP',
+      '    tcp-request content reject if !HTTP',
       `    http-request return status 503 content-type "text/html; charset=utf-8" file ${this.errorPagePath}`,
     );
 
