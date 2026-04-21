@@ -135,18 +135,6 @@ defaults
 # Shared abuse-detection table (per source IP, across all frontends)
 backend abuse_table
     stick-table type ipv6 size 1m expire 30m store conn_rate(10s),conn_cur,sess_rate(10s),gpc0,gpc0_rate(1m)
-
-frontend fallback_error
-    bind *:${FALLBACK_PORT}
-    mode http
-    timeout client 5s
-    tcp-request connection track-sc0 src table abuse_table
-    tcp-request connection reject if { sc0_get_gpc0 gt 0 }
-    tcp-request connection reject if { sc0_conn_rate gt 50 }
-    tcp-request inspect-delay 2s
-    tcp-request content sc-inc-gpc0(0) if !HTTP
-    tcp-request content reject if !HTTP
-    http-request return status 503 content-type "text/html; charset=utf-8" file /etc/haproxy/errors/503.html
 HAPCFG
 
 systemctl enable haproxy
@@ -187,22 +175,14 @@ SYSCTL
 modprobe nf_conntrack 2>/dev/null || true
 sysctl --system >/dev/null || warn "sysctl --system returned non-zero (non-fatal)"
 
-# ───────────────────────── iptables fallback rules ────────
-log "Setting up iptables fallback rules..."
-iptables -t nat -N HAPROXY_FALLBACK 2>/dev/null || iptables -t nat -F HAPROXY_FALLBACK
-
-# Protect system ports
-iptables -t nat -A HAPROXY_FALLBACK -p tcp --dport 22 -j RETURN
-iptables -t nat -A HAPROXY_FALLBACK -p tcp --dport ${API_PORT} -j RETURN
-iptables -t nat -A HAPROXY_FALLBACK -p tcp --dport ${FALLBACK_PORT} -j RETURN
-
-# Redirect everything else to fallback
-iptables -t nat -A HAPROXY_FALLBACK -p tcp -j REDIRECT --to-port ${FALLBACK_PORT}
-
-# Attach to PREROUTING if not already
-if ! iptables -t nat -S PREROUTING | grep -q "HAPROXY_FALLBACK"; then
-  iptables -t nat -A PREROUTING -p tcp -j HAPROXY_FALLBACK
-fi
+# ───────────────────────── Cleanup old NAT fallback ───────
+# Раньше трафик на неизвестные порты редиректился на FALLBACK_PORT через NAT.
+# Это делало HAProxy мишенью для сканеров. Теперь неизвестные порты дропаются
+# естественно (RST от ядра / INPUT DROP). Чистим старую цепочку если осталась.
+log "Removing legacy NAT fallback chain..."
+iptables -t nat -D PREROUTING -p tcp -j HAPROXY_FALLBACK 2>/dev/null || true
+iptables -t nat -F HAPROXY_FALLBACK 2>/dev/null || true
+iptables -t nat -X HAPROXY_FALLBACK 2>/dev/null || true
 
 # ───────────────────────── iptables filter (DDoS) ─────────
 log "Setting up iptables filter rules (SYN-flood, connlimit, scan blocking)..."

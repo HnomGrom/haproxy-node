@@ -12,19 +12,12 @@ const execAsync = promisify(exec);
 export class HaproxyService {
   private readonly logger = new Logger(HaproxyService.name);
   private readonly configPath: string;
-  private readonly fallbackPort: number;
-  private readonly errorPagePath: string;
 
   constructor(
     private readonly config: ConfigService,
     private readonly iptables: IptablesService,
   ) {
     this.configPath = this.config.get<string>('HAPROXY_CONFIG_PATH');
-    this.fallbackPort = Number(this.config.get('FALLBACK_PORT', 59999));
-    this.errorPagePath = this.config.get<string>(
-      'ERROR_PAGE_PATH',
-      '/etc/haproxy/errors/503.html',
-    );
   }
 
   buildConfig(servers: Server[]): string {
@@ -81,23 +74,6 @@ export class HaproxyService {
         `    server s_${server.id} ${server.ip}:${server.backendPort} check inter 30s fall 3 rise 2`,
       );
     }
-
-    // Catch-all HTTP frontend for unknown ports (iptables redirects here)
-    // Rate-limited so port scanners and non-HTTP garbage get banned globally
-    lines.push(
-      '',
-      'frontend fallback_error',
-      `    bind *:${this.fallbackPort}`,
-      '    mode http',
-      '    timeout client 5s',
-      '    tcp-request connection track-sc0 src table abuse_table',
-      '    tcp-request connection reject if { sc0_get_gpc0 gt 0 }',
-      '    tcp-request connection reject if { sc0_conn_rate gt 50 }',
-      '    tcp-request inspect-delay 2s',
-      '    tcp-request content sc-inc-gpc0(0) if !HTTP',
-      '    tcp-request content reject if !HTTP',
-      `    http-request return status 503 content-type "text/html; charset=utf-8" file ${this.errorPagePath}`,
-    );
 
     return lines.join('\n') + '\n';
   }
