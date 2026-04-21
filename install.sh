@@ -40,6 +40,14 @@ PORT_MAX="${PORT_MAX:-65000}"
 read -rp "Fallback error page port [59999]: " FALLBACK_PORT
 FALLBACK_PORT="${FALLBACK_PORT:-59999}"
 
+# IP-адреса, которым разрешён доступ к API (через запятую).
+# Пусто = API полностью закрыт (только с localhost).
+# Пример: 38.180.122.151,203.0.113.5
+read -rp "IPv4 (через запятую) с доступом к API, например IP панели Remnawave [пусто = закрыт]: " API_ALLOWED_IPS
+
+# IPv6 адреса панели / админа (опционально)
+read -rp "IPv6 (через запятую) с доступом к API [пусто = нет]: " API_ALLOWED_IPS_V6
+
 # ───────────────────────── Install system deps ────────────
 log "Updating packages..."
 apt-get update -qq
@@ -78,6 +86,8 @@ PORT=${API_PORT}
 FRONTEND_PORT_MIN=${PORT_MIN}
 FRONTEND_PORT_MAX=${PORT_MAX}
 FALLBACK_PORT=${FALLBACK_PORT}
+API_ALLOWED_IPS="${API_ALLOWED_IPS}"
+API_ALLOWED_IPS_V6="${API_ALLOWED_IPS_V6}"
 ERROR_PAGE_PATH="/etc/haproxy/errors/503.html"
 EOF
 
@@ -219,10 +229,209 @@ iptables -A HAPROXY_DDOS -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_M
 iptables -A HAPROXY_DDOS -p icmp -m limit --limit 5/s --limit-burst 10 -j RETURN
 iptables -A HAPROXY_DDOS -p icmp -j DROP
 
-# Attach DDoS chain at the top of INPUT so it runs before any other rule
-iptables -I INPUT 1 -j HAPROXY_DDOS
+# HAPROXY_DDOS будет привязана к INPUT в lockdown-блоке ниже,
+# одновременно с policy DROP и whitelist-правилами
 
-# Persist iptables rules across reboots (filter + nat tables)
+# ───────────────────────── ip6tables filter (DDoS) ────────
+# Проверяем что IPv6 работает на сервере
+IPV6_ENABLED=false
+if command -v ip6tables &>/dev/null && ip6tables -S INPUT &>/dev/null; then
+  IPV6_ENABLED=true
+  log "Setting up ip6tables filter rules (same as IPv4)..."
+
+  # Idempotent
+  ip6tables -D INPUT -j HAPROXY_DDOS6 2>/dev/null || true
+  ip6tables -F HAPROXY_DDOS6 2>/dev/null || true
+  ip6tables -X HAPROXY_DDOS6 2>/dev/null || true
+  ip6tables -N HAPROXY_DDOS6
+
+  # Fast path для ESTABLISHED
+  ip6tables -A HAPROXY_DDOS6 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+
+  # INVALID drop
+  ip6tables -A HAPROXY_DDOS6 -m conntrack --ctstate INVALID -j DROP
+
+  # TCP scan flags (SYN+FIN, SYN+RST, FIN+RST, NULL, XMAS)
+  ip6tables -A HAPROXY_DDOS6 -p tcp --tcp-flags ALL NONE -j DROP
+  ip6tables -A HAPROXY_DDOS6 -p tcp --tcp-flags ALL ALL  -j DROP
+  ip6tables -A HAPROXY_DDOS6 -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP
+  ip6tables -A HAPROXY_DDOS6 -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
+  ip6tables -A HAPROXY_DDOS6 -p tcp --tcp-flags FIN,RST FIN,RST -j DROP
+
+  # Per-IP connlimit на VLESS (mask 128 = /128 для IPv6)
+  ip6tables -A HAPROXY_DDOS6 -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_MAX} \
+    -m connlimit --connlimit-above 20 --connlimit-mask 128 -j DROP
+
+  # SYN-flood rate limit
+  ip6tables -A HAPROXY_DDOS6 -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_MAX} \
+    -m limit --limit 200/s --limit-burst 400 -j RETURN
+  ip6tables -A HAPROXY_DDOS6 -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_MAX} -j DROP
+else
+  warn "IPv6 не активен на сервере (ip6tables недоступен) — пропускаю IPv6 защиту"
+fi
+
+# ───────────────────────── INPUT Lockdown (policy DROP) ──────
+# Пересобираем INPUT с нуля. Всё что не в whitelist — дропается.
+log "Lockdown: rebuilding INPUT chain with policy DROP + explicit whitelist..."
+
+# ВАЖНО: сначала policy в ACCEPT — чтобы при переустановке (когда policy уже DROP)
+# flush не разорвал SSH между командами
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+
+# Flush старых правил INPUT (на случай переустановки).
+# Делается ДО ipset destroy, иначе set "in use" не удалится.
+iptables -F INPUT
+
+# ───────────────────────── API whitelist (порт ${API_PORT}) ──────
+# Создаётся после flush INPUT — старые ссылки на set уже сброшены.
+# Install ipset if missing (понадобится для любого whitelist)
+if { [ -n "${API_ALLOWED_IPS}" ] || [ -n "${API_ALLOWED_IPS_V6}" ]; } && ! command -v ipset &>/dev/null; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ipset
+fi
+
+# IPv4 whitelist
+if [ -n "${API_ALLOWED_IPS}" ]; then
+  log "Configuring IPv4 API whitelist for port ${API_PORT}..."
+  ipset destroy api_whitelist 2>/dev/null || true
+  ipset create api_whitelist hash:net maxelem 128
+
+  ipset add api_whitelist 127.0.0.1 2>/dev/null || true
+
+  IFS=',' read -ra IP_LIST <<< "${API_ALLOWED_IPS//[[:space:]]/}"
+  for ip in "${IP_LIST[@]}"; do
+    [ -z "$ip" ] && continue
+    if ipset add api_whitelist "$ip" 2>/dev/null; then
+      log "  + allow API access (v4): $ip"
+    else
+      warn "  ? invalid or duplicate v4: $ip"
+    fi
+  done
+else
+  warn "API_ALLOWED_IPS (IPv4) пуст — API :${API_PORT} ЗАКРЫТ для IPv4 (policy DROP)"
+fi
+
+# IPv6 whitelist
+if [ "${IPV6_ENABLED}" = "true" ] && [ -n "${API_ALLOWED_IPS_V6}" ]; then
+  log "Configuring IPv6 API whitelist for port ${API_PORT}..."
+  ipset destroy api_whitelist6 2>/dev/null || true
+  ipset create api_whitelist6 hash:net family inet6 maxelem 128
+
+  ipset add api_whitelist6 ::1 2>/dev/null || true
+
+  IFS=',' read -ra IP_LIST_V6 <<< "${API_ALLOWED_IPS_V6//[[:space:]]/}"
+  for ip in "${IP_LIST_V6[@]}"; do
+    [ -z "$ip" ] && continue
+    if ipset add api_whitelist6 "$ip" 2>/dev/null; then
+      log "  + allow API access (v6): $ip"
+    else
+      warn "  ? invalid or duplicate v6: $ip"
+    fi
+  done
+fi
+
+# 1. HAPROXY_DDOS первой — фильтрует SYN-flood / сканы / connlimit
+iptables -A INPUT -j HAPROXY_DDOS
+
+# 2. Essentials
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
+
+# 3. SSH с rate-limit (отбивает brute-force без fail2ban)
+iptables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW \
+  -m recent --set --name SSH --rsource
+iptables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW \
+  -m recent --update --seconds 60 --hitcount 4 --name SSH --rsource -j DROP
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+
+# 4. API — только для IP из api_whitelist (если задан)
+if [ -n "${API_ALLOWED_IPS}" ]; then
+  iptables -A INPUT -p tcp --dport ${API_PORT} -m set --match-set api_whitelist src -j ACCEPT
+  log "  ACCEPT ${API_PORT}/tcp для api_whitelist"
+fi
+
+# 5. VLESS frontend-диапазон — пропускаем, внутри HAPROXY_DDOS уже стоит rate-limit
+iptables -A INPUT -p tcp -m multiport --dports ${PORT_MIN}:${PORT_MAX} -j ACCEPT
+
+# 6. ICMP с rate-limit (ping для диагностики)
+iptables -A INPUT -p icmp -m limit --limit 5/s --limit-burst 10 -j ACCEPT
+
+# 7. ТЕПЕРЬ включаем Policy DROP — все правила выше уже собраны
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT ACCEPT
+
+log "IPv4 INPUT policy DROP активна. Открытые порты: 22 (SSH), ${PORT_MIN}-${PORT_MAX} (VLESS)"
+[ -n "${API_ALLOWED_IPS}" ] && log "  + ${API_PORT} (API) — только для api_whitelist"
+
+# ───────────────────────── IPv6 Lockdown (policy DROP) ──────
+if [ "${IPV6_ENABLED}" = "true" ]; then
+  log "IPv6 lockdown: rebuilding ip6tables INPUT chain with policy DROP..."
+
+  # Policy ACCEPT перед flush — не рвём существующий IPv6 SSH
+  ip6tables -P INPUT ACCEPT
+  ip6tables -P FORWARD ACCEPT
+  ip6tables -F INPUT
+
+  # 1. HAPROXY_DDOS6 первой
+  ip6tables -A INPUT -j HAPROXY_DDOS6
+
+  # 2. Essentials
+  ip6tables -A INPUT -i lo -j ACCEPT
+  ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  ip6tables -A INPUT -m conntrack --ctstate INVALID -j DROP
+
+  # 3. КРИТИЧНО: ICMPv6 — нужен для Neighbor Discovery, Router Advertisement, PMTU.
+  # Без этого IPv6 связь сломается (не работает NDP, MTU, link-local).
+  # Разрешаем обязательные типы без лимита, всё остальное с rate-limit.
+  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type neighbor-solicitation -j ACCEPT
+  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type neighbor-advertisement -j ACCEPT
+  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type router-solicitation -j ACCEPT
+  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type router-advertisement -j ACCEPT
+  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type packet-too-big -j ACCEPT
+  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type destination-unreachable -j ACCEPT
+  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type parameter-problem -j ACCEPT
+  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type time-exceeded -j ACCEPT
+  # echo-request (ping6) — с rate-limit
+  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 5/s -j ACCEPT
+
+  # 4. SSH с rate-limit (работает и для IPv6)
+  ip6tables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW \
+    -m recent --set --name SSH6 --rsource
+  ip6tables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW \
+    -m recent --update --seconds 60 --hitcount 4 --name SSH6 --rsource -j DROP
+  ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT
+
+  # 5. API IPv6 whitelist (если задан)
+  if [ -n "${API_ALLOWED_IPS_V6}" ]; then
+    ip6tables -A INPUT -p tcp --dport ${API_PORT} -m set --match-set api_whitelist6 src -j ACCEPT
+    log "  ACCEPT ${API_PORT}/tcp (v6) для api_whitelist6"
+  fi
+
+  # 6. VLESS диапазон
+  ip6tables -A INPUT -p tcp -m multiport --dports ${PORT_MIN}:${PORT_MAX} -j ACCEPT
+
+  # 7. Policy DROP
+  ip6tables -P INPUT DROP
+  ip6tables -P FORWARD DROP
+  ip6tables -P OUTPUT ACCEPT
+
+  log "IPv6 INPUT policy DROP активна"
+fi
+
+# ───────────────────────── ipset persistence ──────────────
+ipset save > /etc/ipset.conf 2>/dev/null || true
+if [ ! -f /etc/network/if-pre-up.d/ipset-restore ]; then
+  cat > /etc/network/if-pre-up.d/ipset-restore <<'IPSET_RESTORE'
+#!/bin/sh
+[ -f /etc/ipset.conf ] && /sbin/ipset restore < /etc/ipset.conf
+exit 0
+IPSET_RESTORE
+  chmod +x /etc/network/if-pre-up.d/ipset-restore
+fi
+
+# Persist iptables + ip6tables rules across reboots
 if ! command -v netfilter-persistent &>/dev/null; then
   log "Installing iptables-persistent for rule persistence..."
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent
@@ -232,6 +441,9 @@ if command -v netfilter-persistent &>/dev/null; then
 elif command -v iptables-save &>/dev/null; then
   mkdir -p /etc/iptables
   iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+  if [ "${IPV6_ENABLED}" = "true" ] && command -v ip6tables-save &>/dev/null; then
+    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+  fi
 fi
 
 # ───────────────────────── Systemd service ────────────────
