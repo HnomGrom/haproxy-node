@@ -113,18 +113,28 @@ log "Writing initial HAProxy config..."
 cat > /etc/haproxy/haproxy.cfg <<HAPCFG
 global
     log /dev/log local0
-    maxconn 50000
+    maxconn 100000
+    nbthread 4
+    stats socket /run/haproxy/admin.sock mode 660 level admin
+    stats timeout 30s
     daemon
 
 defaults
     log global
     mode tcp
-    timeout connect 5s
-    timeout client  1h
-    timeout server  1h
+    option tcplog
+    option dontlognull
+    option tcp-smart-accept
+    timeout connect 3s
+    timeout client  30m
+    timeout server  30m
     timeout tunnel  1h
-    timeout client-fin 30s
-    timeout server-fin 30s
+    timeout client-fin 10s
+    timeout server-fin 10s
+
+# Shared abuse-detection table (per source IP, across all frontends)
+backend abuse_table
+    stick-table type ipv6 size 1m expire 30m store conn_rate(10s),conn_cur,sess_rate(10s),gpc0,gpc0_rate(1m)
 
 frontend fallback_error
     bind *:${FALLBACK_PORT}
@@ -135,6 +145,41 @@ HAPCFG
 
 systemctl enable haproxy
 systemctl restart haproxy
+
+# ───────────────────────── Kernel tuning (sysctl) ─────────
+log "Applying kernel DDoS protection (sysctl)..."
+cat > /etc/sysctl.d/99-haproxy-ddos.conf <<'SYSCTL'
+# SYN-flood protection
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 3
+
+# Conntrack sizing (needed for connlimit / high connection counts)
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 600
+
+# TCP tuning for long-lived VLESS connections
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 16384
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# Anti-spoofing / bogus traffic
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+SYSCTL
+
+# Load nf_conntrack module so conntrack sysctl keys exist before we apply
+modprobe nf_conntrack 2>/dev/null || true
+sysctl --system >/dev/null || warn "sysctl --system returned non-zero (non-fatal)"
 
 # ───────────────────────── iptables fallback rules ────────
 log "Setting up iptables fallback rules..."
@@ -153,10 +198,53 @@ if ! iptables -t nat -S PREROUTING | grep -q "HAPROXY_FALLBACK"; then
   iptables -t nat -A PREROUTING -p tcp -j HAPROXY_FALLBACK
 fi
 
-# Persist iptables rules across reboots
+# ───────────────────────── iptables filter (DDoS) ─────────
+log "Setting up iptables filter rules (SYN-flood, connlimit, scan blocking)..."
+
+# Idempotent: drop our chain if it already exists, then recreate
+iptables -D INPUT -j HAPROXY_DDOS 2>/dev/null || true
+iptables -F HAPROXY_DDOS 2>/dev/null || true
+iptables -X HAPROXY_DDOS 2>/dev/null || true
+iptables -N HAPROXY_DDOS
+
+# Fast path: pass ESTABLISHED,RELATED without further checks
+iptables -A HAPROXY_DDOS -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+
+# Drop invalid packets (malformed / out-of-state)
+iptables -A HAPROXY_DDOS -m conntrack --ctstate INVALID -j DROP
+
+# Drop stealth / malformed TCP scans
+iptables -A HAPROXY_DDOS -p tcp --tcp-flags ALL NONE -j DROP
+iptables -A HAPROXY_DDOS -p tcp --tcp-flags ALL ALL  -j DROP
+iptables -A HAPROXY_DDOS -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP
+iptables -A HAPROXY_DDOS -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
+iptables -A HAPROXY_DDOS -p tcp --tcp-flags FIN,RST FIN,RST -j DROP
+
+# Per-IP connection limit on VLESS frontend port range (prevents connection flood)
+iptables -A HAPROXY_DDOS -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_MAX} \
+  -m connlimit --connlimit-above 20 --connlimit-mask 32 -j DROP
+
+# Global SYN-flood rate limit on VLESS ports (in addition to syncookies)
+iptables -A HAPROXY_DDOS -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_MAX} \
+  -m limit --limit 200/s --limit-burst 400 -j RETURN
+iptables -A HAPROXY_DDOS -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_MAX} -j DROP
+
+# ICMP rate limit (keep ping usable but cheap to abuse)
+iptables -A HAPROXY_DDOS -p icmp -m limit --limit 5/s --limit-burst 10 -j RETURN
+iptables -A HAPROXY_DDOS -p icmp -j DROP
+
+# Attach DDoS chain at the top of INPUT so it runs before any other rule
+iptables -I INPUT 1 -j HAPROXY_DDOS
+
+# Persist iptables rules across reboots (filter + nat tables)
+if ! command -v netfilter-persistent &>/dev/null; then
+  log "Installing iptables-persistent for rule persistence..."
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent
+fi
 if command -v netfilter-persistent &>/dev/null; then
   netfilter-persistent save
 elif command -v iptables-save &>/dev/null; then
+  mkdir -p /etc/iptables
   iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 fi
 
