@@ -6,6 +6,7 @@ import { CrowdsecService } from '../crowdsec/crowdsec.service';
 import { exec } from 'child_process';
 import { readFile, writeFile } from 'fs/promises';
 import { promisify } from 'util';
+import { cpus } from 'os';
 
 const execAsync = promisify(exec);
 
@@ -29,16 +30,16 @@ export class HaproxyService {
   }
 
   buildConfig(servers: Server[]): string {
+    // HAProxy 2.8 (Ubuntu 24.04) не принимает 'nbthread auto' — нужно число
+    const nbThread = Math.max(1, Math.min(cpus().length, 64));
+
     const lines: string[] = [
       'global',
       '    log /dev/log local0',
       '    maxconn 200000',
-      // nbthread auto — HAProxy 2.4+ сам выбирает по числу CPU cores
-      '    nbthread auto',
-      '    cpu-map auto:1/1-64 0-63',
+      `    nbthread ${nbThread}`,
       '    stats socket /run/haproxy/admin.sock mode 660 level admin',
       '    stats timeout 30s',
-      '    ulimit-n 500000',
       '    daemon',
       '',
       'defaults',
@@ -47,7 +48,6 @@ export class HaproxyService {
       '    option tcplog',
       '    option dontlognull',
       '    option tcp-smart-accept',
-      '    option tcp-smart-connect',
       '    option redispatch',
       '    retries 3',
       // timeout connect 5s — backend может тормозить под атакой, даём запас

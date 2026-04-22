@@ -162,15 +162,16 @@ if [[ ! -f /etc/haproxy/haproxy.cfg.original ]]; then
 fi
 
 log "Writing initial HAProxy config..."
+# nbthread — число CPU ядер (HAProxy 2.8 не принимает 'auto')
+NBTHREAD=$(nproc 2>/dev/null || echo 4)
+[ "${NBTHREAD}" -gt 64 ] 2>/dev/null && NBTHREAD=64
 cat > /etc/haproxy/haproxy.cfg <<HAPCFG
 global
     log /dev/log local0
     maxconn 200000
-    nbthread auto
-    cpu-map auto:1/1-64 0-63
+    nbthread ${NBTHREAD}
     stats socket /run/haproxy/admin.sock mode 660 level admin
     stats timeout 30s
-    ulimit-n 500000
     daemon
 
 defaults
@@ -179,7 +180,6 @@ defaults
     option tcplog
     option dontlognull
     option tcp-smart-accept
-    option tcp-smart-connect
     option redispatch
     retries 3
     timeout connect 5s
