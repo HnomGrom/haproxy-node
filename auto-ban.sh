@@ -172,16 +172,37 @@ done
 
 # КРИТИЧНО: автоматически whitelist'им backend IP из БД через API
 # Иначе auto-ban забанит наши собственные Xray-ноды!
+# Если API недоступен — НЕ БАНИМ ничего (safety first)
+BACKEND_FETCH_OK=true
 if [ -f /opt/haproxy-node/.env ]; then
   API_KEY=$(grep "^API_KEY=" /opt/haproxy-node/.env | cut -d'"' -f2)
   API_PORT=$(grep "^PORT=" /opt/haproxy-node/.env | cut -d= -f2)
   if [ -n "${API_KEY}" ] && [ -n "${API_PORT}" ]; then
-    BACKEND_IPS=$(curl -s --max-time 3 -H "x-api-key: ${API_KEY}" \
-      "http://127.0.0.1:${API_PORT}/servers" 2>/dev/null | \
-      grep -oE '"ip":"[0-9.]+"' | cut -d'"' -f4)
+    # До 3 попыток с паузой — API может стартовать после systemd restart
+    BACKEND_IPS=""
+    for attempt in 1 2 3; do
+      BACKEND_IPS=$(curl -s --max-time 10 --retry 0 \
+        -H "x-api-key: ${API_KEY}" \
+        "http://127.0.0.1:${API_PORT}/servers" 2>/dev/null | \
+        grep -oE '"ip":"[0-9.]+"' | cut -d'"' -f4)
+      [ -n "${BACKEND_IPS}" ] && break
+      # Проверяем что API вообще ответил (хоть чем-то)
+      if curl -s --max-time 3 "http://127.0.0.1:${API_PORT}/" >/dev/null 2>&1; then
+        # API отвечает но серверов пусто — это нормально
+        BACKEND_FETCH_OK=true
+        break
+      fi
+      sleep 2
+    done
     if [ -n "${BACKEND_IPS}" ]; then
       WHITELIST="${WHITELIST} ${BACKEND_IPS}"
       log "Backend IP (из БД) добавлены в whitelist: $(echo ${BACKEND_IPS} | tr '\n' ' ')"
+    elif ! ${BACKEND_FETCH_OK}; then
+      # API полностью недоступен после 3 попыток — это опасно
+      # Скорее всего приложение перезапускается — НЕ банить
+      warn "API haproxy-node недоступен после 3 попыток — отменяю бан (safety)"
+      rm -f "${TCPDUMP_OUT:-}" 2>/dev/null
+      exit 0
     fi
   fi
 fi

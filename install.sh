@@ -341,8 +341,10 @@ fi
 # IPv4 whitelist
 if [ -n "${API_ALLOWED_IPS}" ]; then
   log "Configuring IPv4 API whitelist for port ${API_PORT}..."
-  ipset destroy api_whitelist 2>/dev/null || true
-  ipset create api_whitelist hash:net maxelem 128
+  # Создать set (если его нет) + flush (очистить содержимое).
+  # Этот паттерн безопасен если set уже есть и используется iptables-правилами.
+  ipset create api_whitelist hash:net maxelem 128 2>/dev/null || true
+  ipset flush api_whitelist
 
   ipset add api_whitelist 127.0.0.1 2>/dev/null || true
 
@@ -362,8 +364,8 @@ fi
 # SSH IPv4 whitelist
 if [ -n "${SSH_ALLOWED_IPS}" ]; then
   log "Configuring IPv4 SSH whitelist..."
-  ipset destroy ssh_whitelist 2>/dev/null || true
-  ipset create ssh_whitelist hash:net maxelem 128
+  ipset create ssh_whitelist hash:net maxelem 128 2>/dev/null || true
+  ipset flush ssh_whitelist
 
   IFS=',' read -ra SSH_IP_LIST <<< "${SSH_ALLOWED_IPS//[[:space:]]/}"
   for ip in "${SSH_IP_LIST[@]}"; do
@@ -379,8 +381,8 @@ fi
 # SSH IPv6 whitelist
 if [ "${IPV6_ENABLED}" = "true" ] && [ -n "${SSH_ALLOWED_IPS_V6}" ]; then
   log "Configuring IPv6 SSH whitelist..."
-  ipset destroy ssh_whitelist6 2>/dev/null || true
-  ipset create ssh_whitelist6 hash:net family inet6 maxelem 128
+  ipset create ssh_whitelist6 hash:net family inet6 maxelem 128 2>/dev/null || true
+  ipset flush ssh_whitelist6
 
   IFS=',' read -ra SSH_IP_LIST_V6 <<< "${SSH_ALLOWED_IPS_V6//[[:space:]]/}"
   for ip in "${SSH_IP_LIST_V6[@]}"; do
@@ -396,8 +398,8 @@ fi
 # IPv6 whitelist (API)
 if [ "${IPV6_ENABLED}" = "true" ] && [ -n "${API_ALLOWED_IPS_V6}" ]; then
   log "Configuring IPv6 API whitelist for port ${API_PORT}..."
-  ipset destroy api_whitelist6 2>/dev/null || true
-  ipset create api_whitelist6 hash:net family inet6 maxelem 128
+  ipset create api_whitelist6 hash:net family inet6 maxelem 128 2>/dev/null || true
+  ipset flush api_whitelist6
 
   ipset add api_whitelist6 ::1 2>/dev/null || true
 
