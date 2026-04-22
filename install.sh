@@ -651,9 +651,13 @@ if [[ "${INSTALL_AUTOBAN^^}" =~ ^Y ]] && [ -f "${APP_DIR}/auto-ban.sh" ]; then
   cp "${APP_DIR}/auto-ban.sh" /usr/local/bin/auto-ban.sh
   chmod +x /usr/local/bin/auto-ban.sh
   touch /var/log/auto-ban.log
-  # Удаляем старую запись если есть, добавляем новую
-  (crontab -l 2>/dev/null | grep -v 'auto-ban.sh'; \
-   echo "* * * * * /usr/local/bin/auto-ban.sh >> /var/log/auto-ban.log 2>&1") | crontab -
+  # Удаляем старую запись если есть, добавляем новую.
+  # `|| true` — защита от случая когда у root нет crontab ещё (первая установка),
+  # grep возвращает 1 из-за пустого input, и pipefail останавливает скрипт.
+  {
+    crontab -l 2>/dev/null | grep -v 'auto-ban.sh' || true
+    echo "* * * * * /usr/local/bin/auto-ban.sh >> /var/log/auto-ban.log 2>&1"
+  } | crontab - || warn "crontab не удалось обновить — установите вручную"
   log "Auto-ban cron активен (каждую минуту). Логи: /var/log/auto-ban.log"
   log "Статус:  sudo bash /usr/local/bin/auto-ban.sh --stats"
 fi
