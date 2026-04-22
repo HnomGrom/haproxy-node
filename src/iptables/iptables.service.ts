@@ -1,117 +1,42 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
 
-const CHAIN_NAME = 'HAPROXY_FALLBACK';
+const LEGACY_CHAIN = 'HAPROXY_FALLBACK';
 
+/**
+ * Legacy: ранее служба создавала NAT-цепочку HAPROXY_FALLBACK,
+ * которая редиректила неизвестный трафик на fallback-порт. Это делало
+ * HAProxy мишенью для сканеров.
+ *
+ * Теперь неизвестные порты дропаются policy INPUT DROP (см. install.sh).
+ * Служба только удаляет старую цепочку — для миграции с прошлых версий.
+ */
 @Injectable()
-export class IptablesService {
+export class IptablesService implements OnModuleInit {
   private readonly logger = new Logger(IptablesService.name);
-  private readonly fallbackPort: number;
-  private readonly apiPort: number;
 
-  constructor(private readonly config: ConfigService) {
-    this.fallbackPort = Number(this.config.get('FALLBACK_PORT', 59999));
-    this.apiPort = Number(this.config.get('PORT', 3000));
+  async onModuleInit(): Promise<void> {
+    await this.cleanup();
   }
 
-  async applyRules(serverPorts: number[]): Promise<void> {
-    try {
-      await this.ensureChainExists();
-      await this.flushChain();
-
-      // Protect SSH
-      await this.addReturn(22);
-
-      // Protect API port
-      await this.addReturn(this.apiPort);
-
-      // Protect fallback port itself (avoid redirect loop)
-      await this.addReturn(this.fallbackPort);
-
-      // Protect each server frontend port
-      for (const port of serverPorts) {
-        await this.addReturn(port);
-      }
-
-      // Everything else → redirect to fallback
-      await execAsync(
-        `iptables -t nat -A ${CHAIN_NAME} -p tcp -j REDIRECT --to-port ${this.fallbackPort}`,
-      );
-
-      // Attach chain to PREROUTING if not already attached
-      await this.attachToPrerouting();
-
-      this.logger.log(
-        `iptables rules applied: ${serverPorts.length} server ports protected, fallback on :${this.fallbackPort}`,
-      );
-    } catch (error) {
-      this.logger.error('Failed to apply iptables rules', error);
-      throw error;
-    }
+  // Вызывается из HaproxyService.applyConfig() — для совместимости. Ничего не создаёт.
+  async applyRules(_serverPorts: number[]): Promise<void> {
+    await this.cleanup();
   }
 
   async cleanup(): Promise<void> {
     try {
-      await this.detachFromPrerouting();
-      await this.flushChain();
-      await execAsync(`iptables -t nat -X ${CHAIN_NAME}`).catch(() => {});
-      this.logger.log('iptables rules cleaned up');
-    } catch (error) {
-      this.logger.error('Failed to cleanup iptables rules', error);
-    }
-  }
-
-  private async ensureChainExists(): Promise<void> {
-    try {
-      await execAsync(`iptables -t nat -n -L ${CHAIN_NAME}`);
-    } catch {
-      await execAsync(`iptables -t nat -N ${CHAIN_NAME}`);
-    }
-  }
-
-  private async flushChain(): Promise<void> {
-    await execAsync(`iptables -t nat -F ${CHAIN_NAME}`);
-  }
-
-  private async addReturn(port: number): Promise<void> {
-    await execAsync(
-      `iptables -t nat -A ${CHAIN_NAME} -p tcp --dport ${port} -j RETURN`,
-    );
-  }
-
-  private async attachToPrerouting(): Promise<void> {
-    try {
-      const { stdout } = await execAsync(
-        `iptables -t nat -S PREROUTING`,
-      );
-
-      if (!stdout.includes(CHAIN_NAME)) {
-        await execAsync(
-          `iptables -t nat -A PREROUTING -p tcp -j ${CHAIN_NAME}`,
-        );
-      }
-    } catch {
       await execAsync(
-        `iptables -t nat -A PREROUTING -p tcp -j ${CHAIN_NAME}`,
+        `iptables -t nat -D PREROUTING -p tcp -j ${LEGACY_CHAIN} 2>/dev/null || true`,
       );
-    }
-  }
-
-  private async detachFromPrerouting(): Promise<void> {
-    try {
-      // Remove all references to our chain from PREROUTING
-      let hasRule = true;
-      while (hasRule) {
-        await execAsync(
-          `iptables -t nat -D PREROUTING -p tcp -j ${CHAIN_NAME}`,
-        );
-      }
-    } catch {
-      // No more rules to remove
+      await execAsync(`iptables -t nat -F ${LEGACY_CHAIN} 2>/dev/null || true`);
+      await execAsync(`iptables -t nat -X ${LEGACY_CHAIN} 2>/dev/null || true`);
+      this.logger.log(`Legacy NAT chain ${LEGACY_CHAIN} removed (if existed)`);
+    } catch (error) {
+      this.logger.warn('Legacy NAT cleanup returned error (non-fatal)', error);
     }
   }
 }
