@@ -32,10 +32,13 @@ export class HaproxyService {
     const lines: string[] = [
       'global',
       '    log /dev/log local0',
-      '    maxconn 100000',
-      '    nbthread 4',
+      '    maxconn 200000',
+      // nbthread auto — HAProxy 2.4+ сам выбирает по числу CPU cores
+      '    nbthread auto',
+      '    cpu-map auto:1/1-64 0-63',
       '    stats socket /run/haproxy/admin.sock mode 660 level admin',
       '    stats timeout 30s',
+      '    ulimit-n 500000',
       '    daemon',
       '',
       'defaults',
@@ -44,12 +47,20 @@ export class HaproxyService {
       '    option tcplog',
       '    option dontlognull',
       '    option tcp-smart-accept',
-      '    timeout connect 3s',
-      '    timeout client  30m',
-      '    timeout server  30m',
-      '    timeout tunnel  1h',
+      '    option tcp-smart-connect',
+      '    option redispatch',
+      '    retries 3',
+      // timeout connect 5s — backend может тормозить под атакой, даём запас
+      '    timeout connect 5s',
+      // client 1h — не рвём idle VLESS-клиентов
+      '    timeout client  1h',
+      '    timeout server  1h',
+      // tunnel 24h — долгие видео-стримы / игры через VLESS
+      '    timeout tunnel  24h',
       '    timeout client-fin 10s',
       '    timeout server-fin 10s',
+      // queue timeout — если все backend под нагрузкой, не держим клиента вечно
+      '    timeout queue   30s',
       '',
       '# Shared abuse-detection table (per source IP, across all frontends)',
       'backend abuse_table',
@@ -67,12 +78,15 @@ export class HaproxyService {
         `frontend ${server.name}_in`,
         `    bind *:${server.frontendPort}`,
         '    mode tcp',
-        '    maxconn 20000',
+        '    maxconn 50000',
         '    tcp-request connection track-sc0 src table abuse_table',
         '    tcp-request connection reject if { sc0_get_gpc0 gt 0 }',
-        '    tcp-request connection reject if { sc0_conn_rate gt 30 }',
-        '    tcp-request connection reject if { sc0_conn_cur gt 50 }',
-        '    tcp-request inspect-delay 3s',
+        // Более мягкие лимиты для VLESS mux и мобильных клиентов:
+        // VLESS-клиент с mux может открывать 10-20 параллельных TCP
+        '    tcp-request connection reject if { sc0_conn_rate gt 60 }',
+        '    tcp-request connection reject if { sc0_conn_cur gt 100 }',
+        // 5 секунд — достаточно для медленного 3G/4G TLS handshake
+        '    tcp-request inspect-delay 5s',
         '    tcp-request content reject if !{ req.ssl_hello_type 1 }',
         '    tcp-request content sc-inc-gpc0(0) if !{ req.ssl_hello_type 1 }',
       ];
@@ -93,7 +107,9 @@ export class HaproxyService {
         '',
         `backend ${server.name}`,
         '    mode tcp',
-        `    server s_${server.id} ${server.ip}:${server.backendPort} check inter 30s fall 3 rise 2`,
+        // inter 15s + fall 5 = backend DOWN только при 5 подряд сбоях (75 сек).
+        // rise 2 = быстрое возвращение к UP когда backend ожил.
+        `    server s_${server.id} ${server.ip}:${server.backendPort} check inter 15s fall 5 rise 2`,
       );
     }
 

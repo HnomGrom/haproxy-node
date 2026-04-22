@@ -165,10 +165,12 @@ log "Writing initial HAProxy config..."
 cat > /etc/haproxy/haproxy.cfg <<HAPCFG
 global
     log /dev/log local0
-    maxconn 100000
-    nbthread 4
+    maxconn 200000
+    nbthread auto
+    cpu-map auto:1/1-64 0-63
     stats socket /run/haproxy/admin.sock mode 660 level admin
     stats timeout 30s
+    ulimit-n 500000
     daemon
 
 defaults
@@ -177,17 +179,30 @@ defaults
     option tcplog
     option dontlognull
     option tcp-smart-accept
-    timeout connect 3s
-    timeout client  30m
-    timeout server  30m
-    timeout tunnel  1h
+    option tcp-smart-connect
+    option redispatch
+    retries 3
+    timeout connect 5s
+    timeout client  1h
+    timeout server  1h
+    timeout tunnel  24h
     timeout client-fin 10s
     timeout server-fin 10s
+    timeout queue   30s
 
 # Shared abuse-detection table (per source IP, across all frontends)
 backend abuse_table
     stick-table type ipv6 size 1m expire 30m store conn_rate(10s),conn_cur,sess_rate(10s),gpc0,gpc0_rate(1m)
 HAPCFG
+
+# Поднять systemd-лимиты для HAProxy чтобы он мог открыть 500k файлов
+mkdir -p /etc/systemd/system/haproxy.service.d
+cat > /etc/systemd/system/haproxy.service.d/override.conf <<'SYSD'
+[Service]
+LimitNOFILE=500000
+LimitNPROC=500000
+SYSD
+systemctl daemon-reload
 
 systemctl enable haproxy
 systemctl restart haproxy
@@ -211,11 +226,18 @@ net.netfilter.nf_conntrack_tcp_timeout_close_wait = 10
 
 # TCP tuning for long-lived VLESS connections
 net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 16384
+net.core.netdev_max_backlog = 32768
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
+# Keepalive для долгих VLESS-тоннелей (ловим "мёртвые" коннекты быстрее)
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 60
+net.ipv4.tcp_keepalive_probes = 5
+# BBR congestion control — быстрее TCP для мобильных
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
 
 # Anti-spoofing / bogus traffic
 net.ipv4.conf.all.rp_filter = 1
@@ -262,13 +284,15 @@ iptables -A HAPROXY_DDOS -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP
 iptables -A HAPROXY_DDOS -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
 iptables -A HAPROXY_DDOS -p tcp --tcp-flags FIN,RST FIN,RST -j DROP
 
-# Per-IP connection limit on VLESS frontend port range (prevents connection flood)
+# Per-IP connection limit: 40 одновременных SYN с одного IP.
+# 40 = с запасом под VLESS mux (10-20 стримов) + NAT (несколько устройств).
 iptables -A HAPROXY_DDOS -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_MAX} \
-  -m connlimit --connlimit-above 20 --connlimit-mask 32 -j DROP
+  -m connlimit --connlimit-above 40 --connlimit-mask 32 -j DROP
 
-# Global SYN-flood rate limit on VLESS ports (in addition to syncookies)
+# Global SYN-flood rate limit 500/s с burst 1000.
+# Более мягко — пропускает легитимные пики переподключений клиентов.
 iptables -A HAPROXY_DDOS -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_MAX} \
-  -m limit --limit 200/s --limit-burst 400 -j RETURN
+  -m limit --limit 500/s --limit-burst 1000 -j RETURN
 iptables -A HAPROXY_DDOS -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_MAX} -j DROP
 
 # ICMP rate limit (keep ping usable but cheap to abuse)
@@ -304,13 +328,13 @@ if command -v ip6tables &>/dev/null && ip6tables -S INPUT &>/dev/null; then
   ip6tables -A HAPROXY_DDOS6 -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
   ip6tables -A HAPROXY_DDOS6 -p tcp --tcp-flags FIN,RST FIN,RST -j DROP
 
-  # Per-IP connlimit на VLESS (mask 128 = /128 для IPv6)
+  # Per-IP connlimit на VLESS (mask 128 = /128 для IPv6) — 40 как в IPv4
   ip6tables -A HAPROXY_DDOS6 -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_MAX} \
-    -m connlimit --connlimit-above 20 --connlimit-mask 128 -j DROP
+    -m connlimit --connlimit-above 40 --connlimit-mask 128 -j DROP
 
-  # SYN-flood rate limit
+  # SYN-flood rate limit 500/s — согласовано с IPv4
   ip6tables -A HAPROXY_DDOS6 -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_MAX} \
-    -m limit --limit 200/s --limit-burst 400 -j RETURN
+    -m limit --limit 500/s --limit-burst 1000 -j RETURN
   ip6tables -A HAPROXY_DDOS6 -p tcp --syn -m multiport --dports ${PORT_MIN}:${PORT_MAX} -j DROP
 else
   warn "IPv6 не активен на сервере (ip6tables недоступен) — пропускаю IPv6 защиту"

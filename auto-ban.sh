@@ -21,12 +21,13 @@
 set +e
 
 # ───── Defaults ─────
-THRESHOLD_CONN=30
-THRESHOLD_SYN=50
-THRESHOLD_FINWAIT=15
-THRESHOLD_NET=5
+# Пороги мягче для production VLESS (mux + NAT клиенты)
+THRESHOLD_CONN=80       # 1 клиент с mux = 10-30 коннектов, NAT-сем: 40-60
+THRESHOLD_SYN=150       # пик реконнектов при роуминге мобильной сети
+THRESHOLD_FINWAIT=50
+THRESHOLD_NET=10        # /24 подсеть — нужно много IP чтобы забанить всю
 SAMPLE_SECS=10
-BAN_TTL=86400
+BAN_TTL=3600            # 1 час вместо 24 — меньше false positive
 DRY_RUN=false
 UNBAN=false
 SHOW_STATS=false
