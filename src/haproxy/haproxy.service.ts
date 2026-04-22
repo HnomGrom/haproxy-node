@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Server } from '../../generated/prisma/client';
 import { IptablesService } from '../iptables/iptables.service';
+import { CrowdsecService } from '../crowdsec/crowdsec.service';
 import { exec } from 'child_process';
 import { readFile, writeFile } from 'fs/promises';
 import { promisify } from 'util';
@@ -17,6 +18,7 @@ export class HaproxyService {
   constructor(
     private readonly config: ConfigService,
     private readonly iptables: IptablesService,
+    private readonly crowdsec: CrowdsecService,
   ) {
     this.configPath = this.config.get<string>('HAPROXY_CONFIG_PATH');
     const rawSni = this.config.get<string>('ALLOWED_SNI', '') || '';
@@ -134,6 +136,14 @@ export class HaproxyService {
         'iptables rules failed — HAProxy is running but fallback redirect is not active',
         error,
       );
+    }
+
+    // Sync CrowdSec backend whitelist — не критично, ошибки игнорируем
+    try {
+      const backendIps = servers.map((s) => s.ip);
+      await this.crowdsec.syncBackendWhitelist(backendIps);
+    } catch (error) {
+      this.logger.warn('CrowdSec whitelist sync failed (non-critical)', error);
     }
   }
 }
