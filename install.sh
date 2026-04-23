@@ -199,10 +199,22 @@ iptables -t nat -D PREROUTING -p tcp -j HAPROXY_FALLBACK 2>/dev/null || true
 iptables -t nat -F HAPROXY_FALLBACK 2>/dev/null || true
 iptables -t nat -X HAPROXY_FALLBACK 2>/dev/null || true
 
-# ───────────────────────── Install ipset ──────────────────
-if { [ -n "${API_ALLOWED_IPS}" ] || [ -n "${SSH_ALLOWED_IPS}" ]; } && ! command -v ipset &>/dev/null; then
-  log "Installing ipset..."
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ipset >/dev/null
+# ───────────────────────── Install ipset + persistence ───
+# ipset нужен всегда (для vless_lockdown + api/ssh whitelist).
+# ipset-persistent — плагин netfilter-persistent, читает /etc/ipset.conf
+# при boot ДО iptables-restore (иначе правила с match-set ссылаются на
+# несуществующие set'ы и iptables-restore падает).
+if ! command -v ipset &>/dev/null; then
+  log "Installing ipset + ipset-persistent..."
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ipset ipset-persistent >/dev/null 2>&1 || \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ipset >/dev/null
+fi
+# ipset-persistent отдельно — пакет мог быть не установлен на уже
+# существующем сервере с ipset.
+if ! dpkg -s ipset-persistent >/dev/null 2>&1; then
+  log "Installing ipset-persistent (plugin for netfilter-persistent)..."
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ipset-persistent >/dev/null 2>&1 || \
+    warn "ipset-persistent package not available — ipsets могут не восстановиться после reboot"
 fi
 
 # ───────────────────────── API whitelist (ipset) ──────────
@@ -372,8 +384,31 @@ else
   warn "IPv6 не активен на сервере (ip6tables недоступен) — пропускаю IPv6 защиту"
 fi
 
+# ───────────────────────── Lockdown ipset (vless_lockdown) ─
+# Pre-create set с hash:net (поддерживает точные IP + CIDR-диапазоны).
+# Параметры должны совпадать с src/lockdown/lockdown.service.ts (MAX_ELEM, HASH_SIZE).
+log "Ensuring vless_lockdown ipset (hash:net)..."
+EXISTING_TYPE=$(ipset list vless_lockdown 2>/dev/null | awk -F': ' '/^Type/ {print $2}' | head -n1)
+if [ -n "$EXISTING_TYPE" ] && [ "$EXISTING_TYPE" != "hash:net" ]; then
+  warn "Found vless_lockdown with wrong type ($EXISTING_TYPE) — recreating as hash:net"
+  # Снять iptables-правила, ссылающиеся на set (иначе destroy падает "in use")
+  iptables -D INPUT -p tcp -m multiport --dports ${PORT_MIN}:${PORT_MAX} \
+    -m set --match-set vless_lockdown src -j ACCEPT 2>/dev/null || true
+  ipset destroy vless_lockdown
+fi
+ipset create vless_lockdown hash:net maxelem 1000000 hashsize 65536 family inet -exist
+
+FINAL_TYPE=$(ipset list vless_lockdown | awk -F': ' '/^Type/ {print $2}' | head -n1)
+if [ "$FINAL_TYPE" != "hash:net" ]; then
+  err "vless_lockdown has type '$FINAL_TYPE', expected hash:net"
+fi
+
 # ───────────────────────── ipset persistence ──────────────
+# Сохранить все ipsets (api_whitelist, ssh_whitelist, vless_lockdown, *6) в /etc/ipset.conf
 ipset save > /etc/ipset.conf 2>/dev/null || true
+
+# Fallback для старых ifupdown систем (Debian pre-systemd-networkd).
+# На современных Ubuntu/netplan не срабатывает — нужен ipset-persistent плагин.
 if [ ! -f /etc/network/if-pre-up.d/ipset-restore ]; then
   cat > /etc/network/if-pre-up.d/ipset-restore <<'IPSETR'
 #!/bin/sh
@@ -388,6 +423,27 @@ if ! command -v netfilter-persistent &>/dev/null; then
   log "Installing iptables-persistent..."
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent >/dev/null
 fi
+
+# Плагины netfilter-persistent запускаются в алфавитном порядке.
+# ipset-plugin (по умолчанию может быть назван 10-ipset или 25-ipset и т.д.)
+# должен выполниться ДО iptables-plugin (обычно 15-iptables), иначе
+# iptables-restore падает на правилах с --match-set (set'а ещё нет).
+# Переименовываем plugin'ы: iptables становится 50-*, ip6tables 55-*,
+# чтобы любой реально установленный ipset-плагин (05/10/25/45) отработал раньше.
+PLUGINS_DIR="/usr/share/netfilter-persistent/plugins.d"
+if [ -d "${PLUGINS_DIR}" ]; then
+  # ipset-плагин в приоритет — префикс 05
+  for p in "${PLUGINS_DIR}"/*-ipset; do
+    [ -e "$p" ] || continue
+    base=$(basename "$p" | sed -E 's/^[0-9]+-//')
+    target="${PLUGINS_DIR}/05-${base}"
+    if [ "$p" != "$target" ]; then
+      mv "$p" "$target"
+      log "Moved ipset plugin to 05-${base} (runs before iptables at boot)"
+    fi
+  done
+fi
+
 if command -v netfilter-persistent &>/dev/null; then
   netfilter-persistent save >/dev/null 2>&1
 elif command -v iptables-save &>/dev/null; then

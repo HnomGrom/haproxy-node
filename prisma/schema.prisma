@@ -15,3 +15,15 @@ model Server {
   frontendPort Int      @unique
   createdAt    DateTime @default(now())
 }
+
+model LockdownEvent {
+  id        Int      @id @default(autoincrement())
+  action    String
+  source    String
+  reason    String?
+  ipCount   Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([action])
+}
