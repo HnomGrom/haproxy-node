@@ -388,7 +388,12 @@ fi
 # Pre-create set с hash:net (поддерживает точные IP + CIDR-диапазоны).
 # Параметры должны совпадать с src/lockdown/lockdown.service.ts (MAX_ELEM, HASH_SIZE).
 log "Ensuring vless_lockdown ipset (hash:net)..."
-EXISTING_TYPE=$(ipset list vless_lockdown 2>/dev/null | awk -F': ' '/^Type/ {print $2}' | head -n1)
+
+# `|| true` в конце pipe'а — защита от `set -e`:
+#   1. На чистой установке `ipset list vless_lockdown` возвращает exit=1 (set'а нет).
+#   2. `awk '... exit'` останавливает обработку после первого совпадения —
+#      без `head -n1`, который провоцирует SIGPIPE и exit=141 под pipefail.
+EXISTING_TYPE=$(ipset list vless_lockdown 2>/dev/null | awk -F': ' '/^Type/ {print $2; exit}' || true)
 if [ -n "$EXISTING_TYPE" ] && [ "$EXISTING_TYPE" != "hash:net" ]; then
   warn "Found vless_lockdown with wrong type ($EXISTING_TYPE) — recreating as hash:net"
   # Снять iptables-правила, ссылающиеся на set (иначе destroy падает "in use")
@@ -398,7 +403,7 @@ if [ -n "$EXISTING_TYPE" ] && [ "$EXISTING_TYPE" != "hash:net" ]; then
 fi
 ipset create vless_lockdown hash:net maxelem 1000000 hashsize 65536 family inet -exist
 
-FINAL_TYPE=$(ipset list vless_lockdown | awk -F': ' '/^Type/ {print $2}' | head -n1)
+FINAL_TYPE=$(ipset list vless_lockdown | awk -F': ' '/^Type/ {print $2; exit}' || true)
 if [ "$FINAL_TYPE" != "hash:net" ]; then
   err "vless_lockdown has type '$FINAL_TYPE', expected hash:net"
 fi
