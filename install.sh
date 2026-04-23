@@ -150,8 +150,10 @@ log "Syncing database schema..."
 # `db push` читает schema.prisma напрямую и приводит БД в соответствие —
 # идемпотентно, безопасно для additive-изменений. --accept-data-loss нужен
 # чтобы скрипт не висел на prompt'е, если бы вдруг потребовалось удалить столбец.
-# --skip-generate — клиент мы уже сгенерили выше, повторно не нужно.
-cd "${APP_DIR}" && npx prisma db push --accept-data-loss --skip-generate \
+#
+# В Prisma 7.x у `db push` нет флага --skip-generate — клиент перегенерится
+# повторно (~100ms, не критично).
+cd "${APP_DIR}" && npx prisma db push --accept-data-loss \
   || err "Prisma db push failed — БД схема не синхронизирована с schema.prisma"
 
 log "Building application..."
