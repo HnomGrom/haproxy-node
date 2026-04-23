@@ -138,8 +138,21 @@ cd "${APP_DIR}" && NODE_ENV=development npm install
 log "Generating Prisma client..."
 cd "${APP_DIR}" && npx prisma generate
 
-log "Running database migrations..."
-cd "${APP_DIR}" && npx prisma migrate deploy
+log "Syncing database schema..."
+# ВАЖНО: используем `db push`, а не `migrate deploy`.
+#
+# Причина: `migrate deploy` применяет ТОЛЬКО миграции, закоммиченные в git
+# (prisma/migrations/*). Если в schema.prisma появилась модель, но соответствующая
+# миграция не закоммичена — таблица в проде не будет создана. Например, раньше
+# при добавлении LockdownEvent таблица не создавалась и /lockdown/on падал с
+# "no such table: LockdownEvent".
+#
+# `db push` читает schema.prisma напрямую и приводит БД в соответствие —
+# идемпотентно, безопасно для additive-изменений. --accept-data-loss нужен
+# чтобы скрипт не висел на prompt'е, если бы вдруг потребовалось удалить столбец.
+# --skip-generate — клиент мы уже сгенерили выше, повторно не нужно.
+cd "${APP_DIR}" && npx prisma db push --accept-data-loss --skip-generate \
+  || err "Prisma db push failed — БД схема не синхронизирована с schema.prisma"
 
 log "Building application..."
 cd "${APP_DIR}"
@@ -315,6 +328,14 @@ iptables -P OUTPUT ACCEPT
 log "INPUT policy DROP активна. Открыто: :22, :${PORT_MIN}-${PORT_MAX}"
 [ -n "${API_ALLOWED_IPS}" ] && log "  + :${API_PORT} для whitelist"
 
+# Раннее сохранение: если любой из блоков ниже (IPv6, vless_lockdown type-check)
+# прервётся с ошибкой — хотя бы сам firewall уже залит на диск. Иначе после
+# reboot восстановится старое состояние (возможно policy ACCEPT), а мы снова
+# окажемся без защиты. Финальное `netfilter-persistent save` в конце всё равно
+# перезапишет это актуальными правилами.
+mkdir -p /etc/iptables
+iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+
 # ───────────────────────── IPv6 Lockdown ──────────────────
 IPV6_ENABLED=false
 if command -v ip6tables &>/dev/null && ip6tables -S INPUT &>/dev/null; then
@@ -397,6 +418,9 @@ if [ "${IPV6_ENABLED}" = "true" ]; then
   ip6tables -P OUTPUT ACCEPT
 
   log "IPv6 INPUT policy DROP активна"
+
+  # Раннее сохранение v6 (см. комментарий у IPv4 выше)
+  ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
 else
   warn "IPv6 не активен на сервере (ip6tables недоступен) — пропускаю IPv6 защиту"
 fi
@@ -460,8 +484,11 @@ if [ -d "${PLUGINS_DIR}" ]; then
     base=$(basename "$p" | sed -E 's/^[0-9]+-//')
     target="${PLUGINS_DIR}/05-${base}"
     if [ "$p" != "$target" ]; then
-      mv "$p" "$target"
-      log "Moved ipset plugin to 05-${base} (runs before iptables at boot)"
+      if mv "$p" "$target" 2>/dev/null; then
+        log "Moved ipset plugin to 05-${base} (runs before iptables at boot)"
+      else
+        warn "Не удалось переименовать $p → $target (ipset может загружаться после iptables)"
+      fi
     fi
   done
 fi
@@ -499,6 +526,35 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
+# ───────────────────────── Verify service is actually running ─
+# Даём sec на старт, потом проверяем состояние. Если сервис упал
+# (например из-за сломанной миграции или проблемы с зависимостями) —
+# лучше сразу сказать, чем пользователь узнает об этом при первом запросе.
+sleep 3
+if systemctl is-active --quiet "${SERVICE_NAME}"; then
+  log "${SERVICE_NAME} service is ACTIVE"
+else
+  warn "${SERVICE_NAME} service НЕ активен после старта!"
+  warn "  systemctl status ${SERVICE_NAME}"
+  warn "  journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+  echo
+  journalctl -u "${SERVICE_NAME}" -n 20 --no-pager 2>/dev/null || true
+fi
+
+# ───────────────────────── Smoke-test API ─────────────────
+# Проверяем что API отвечает и lockdown-таблица реально создана.
+# Здесь ловим именно твою прошлую проблему: если `prisma db push` не
+# создал LockdownEvent — запрос к /lockdown/status вернёт 500.
+sleep 2
+SMOKE=$(curl -sf --max-time 5 -H "x-api-key: ${API_KEY}" \
+  "http://127.0.0.1:${API_PORT}/lockdown/status" 2>/dev/null || echo "FAILED")
+if echo "${SMOKE}" | grep -q '"enabled"'; then
+  log "Smoke-test /lockdown/status: OK"
+else
+  warn "Smoke-test /lockdown/status FAILED — ответ: ${SMOKE}"
+  warn "  Возможные причины: сервис не поднялся, БД схема не синхронизирована, прокси/firewall"
+fi
+
 # ───────────────────────── Done ───────────────────────────
 log "Installation complete!"
 echo ""
@@ -508,4 +564,5 @@ echo "  Logs:     journalctl -u ${SERVICE_NAME} -f"
 echo ""
 echo "  Usage:"
 echo "    curl -H 'x-api-key: ${API_KEY}' http://localhost:${API_PORT}/servers"
+echo "    curl -H 'x-api-key: ${API_KEY}' http://localhost:${API_PORT}/lockdown/status"
 echo ""
