@@ -18,11 +18,14 @@ export class LockdownService implements OnModuleInit {
   private readonly logger = new Logger(LockdownService.name);
 
   private readonly SET = 'vless_lockdown';
-  private readonly TMP_SET_PREFIX = 'vless_lockdown_tmp';
+  // ipset ограничивает имя set'а в 31 символ (IPSET_MAXNAMELEN).
+  // Префикс 11 + счётчик до 20 цифр = в пределах лимита.
+  private readonly TMP_SET_PREFIX = 'vl_lkd_tmp_';
   private readonly MAX_ELEM = 1_000_000;
   private readonly HASH_SIZE = 65536;
   private readonly PORT_MIN: number;
   private readonly PORT_MAX: number;
+  private tmpCounter = 0;
 
   constructor(
     private readonly config: ConfigService,
@@ -244,10 +247,12 @@ export class LockdownService implements OnModuleInit {
   }
 
   private newTmpSetName(): string {
-    // Уникальное имя защищает от коллизии при параллельных enable() вызовах.
-    return `${this.TMP_SET_PREFIX}_${process.pid}_${Date.now()}_${Math.floor(
-      Math.random() * 1e6,
-    )}`;
+    // Монотонный счётчик защищает от коллизии при параллельных enable()/bulkLoad
+    // вызовах внутри процесса. Между рестартами tmp-set'ы от прошлого run'а
+    // либо уже destroyed в catch-блоке bulkLoadIps, либо будут переиспользованы
+    // через `ipset create -exist` + `flush` — stale state обрабатывается корректно.
+    // ВАЖНО: ipset лимит — 31 символ на имя (IPSET_MAXNAMELEN).
+    return `${this.TMP_SET_PREFIX}${++this.tmpCounter}`;
   }
 
   /**
