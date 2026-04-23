@@ -3,6 +3,12 @@ set -euo pipefail
 
 APP_DIR="/opt/haproxy-node"
 REPO_URL="https://github.com/HnomGrom/haproxy-node.git"
+# Ветка по умолчанию — main. Переопределяется env-переменной (REPO_BRANCH или
+# короткий alias BRANCH) либо интерактивным prompt'ом ниже.
+# Примеры:
+#   REPO_BRANCH=develop bash install.sh
+#   BRANCH=develop bash install.sh
+REPO_BRANCH_DEFAULT="${REPO_BRANCH:-${BRANCH:-main}}"
 SERVICE_NAME="haproxy-node"
 NODE_MAJOR=22
 
@@ -36,6 +42,9 @@ PORT_MIN="${PORT_MIN:-10000}"
 
 read -rp "Frontend port range max [65000]: " PORT_MAX
 PORT_MAX="${PORT_MAX:-65000}"
+
+read -rp "Git branch [${REPO_BRANCH_DEFAULT}]: " REPO_BRANCH
+REPO_BRANCH="${REPO_BRANCH:-${REPO_BRANCH_DEFAULT}}"
 
 # IP, которым разрешён доступ к API (:${API_PORT}) через запятую.
 # Пусто = API ЗАКРЫТ (только с localhost).
@@ -89,13 +98,21 @@ fi
 
 # ───────────────────────── Clone project ──────────────────
 if [[ -d "$APP_DIR/.git" ]]; then
-  log "Updating existing installation..."
+  log "Updating existing installation (branch: ${REPO_BRANCH})..."
   cd "$APP_DIR"
-  git pull --ff-only || true
+  git fetch --all --prune || true
+  # Если нужная ветка уже локально — switch, иначе создаём локальную от origin/<branch>
+  if git show-ref --verify --quiet "refs/heads/${REPO_BRANCH}"; then
+    git checkout "${REPO_BRANCH}" || warn "git checkout ${REPO_BRANCH} failed"
+  else
+    git checkout -B "${REPO_BRANCH}" "origin/${REPO_BRANCH}" || warn "branch ${REPO_BRANCH} not found on remote"
+  fi
+  git pull --ff-only origin "${REPO_BRANCH}" || warn "git pull failed (possibly divergent history — check manually)"
 else
-  log "Cloning repository..."
+  log "Cloning repository (branch: ${REPO_BRANCH})..."
   rm -rf "$APP_DIR"
-  git clone "$REPO_URL" "$APP_DIR"
+  git clone --branch "${REPO_BRANCH}" "$REPO_URL" "$APP_DIR" || \
+    err "git clone failed — ветка '${REPO_BRANCH}' существует в ${REPO_URL}?"
   cd "$APP_DIR"
 fi
 
