@@ -197,23 +197,40 @@ x-api-key: $API_KEY
 **Response** — `200 OK`:
 ```ts
 {
-  enabled: boolean         // есть ли активное match-set правило в iptables
-  whitelistSize: number    // число записей в ipset vless_lockdown
-  lastEvent: LockdownEvent | null  // последнее событие из БД (или null если истории нет)
+  enabled: boolean              // активен ли lockdown хотя бы для одной семьи (v4 ИЛИ v6)
+  enabledV4: boolean            // match-set vless_lockdown активен в iptables
+  enabledV6: boolean            // match-set vless_lockdown6 активен в ip6tables
+  ipv6Enabled: boolean          // поддержка v6 на хосте (детект на старте сервиса)
+  whitelistSize: number         // число записей в ipset vless_lockdown
+  whitelistSizeV6: number       // число записей в ipset vless_lockdown6
+  lastEvent: LockdownEvent | null
 }
 ```
+
+Возможные значения `lastEvent.action`:
+| Action | Семантика |
+|---|---|
+| `enable_attempt` | pre-event перед мутацией (lockdown ещё не применён) |
+| `enable` | lockdown успешно активирован |
+| `enable_failed` | enable() упал — `reason` содержит `[pending=N]` + ошибку |
+| `disable_attempt` / `disable` / `disable_failed` | то же для деактивации |
+| `add` / `remove` | инкрементальные изменения whitelist |
 
 Пример:
 ```json
 {
   "enabled": true,
+  "enabledV4": true,
+  "enabledV6": true,
+  "ipv6Enabled": true,
   "whitelistSize": 12345,
+  "whitelistSizeV6": 320,
   "lastEvent": {
     "id": 42,
     "action": "enable",
     "source": "api",
     "reason": "DDoS 14:30",
-    "ipCount": 12345,
+    "ipCount": 12665,
     "createdAt": "2026-04-23T14:30:00.000Z"
   }
 }
@@ -385,14 +402,37 @@ Content-Type: application/json
 **Response** — `200 OK`:
 ```ts
 {
-  enabled: boolean        // всегда true в успешном ответе
-  whitelistSize: number   // количество уникальных записей после нормализации+дедупликации
+  enabled: boolean              // всегда true в успешном ответе
+  whitelistSize: number         // число записей в vless_lockdown после нормализации+дедупа
+  whitelistSizeV6: number       // то же для vless_lockdown6
+  ipv6Enabled: boolean
+  diagnostics: {
+    v4Rule: boolean             // match-set правило в iptables подтверждено
+    v6Rule: boolean             // match-set правило в ip6tables подтверждено
+    v4SetSize: number
+    v6SetSize: number
+  }
 }
 ```
 
+Семантика по семьям: `enable()` обрабатывает только те family, для которых
+есть IP во входе. Если `ips[]` содержит только v4 — v6 lockdown не трогается
+(остаётся в текущем состоянии). Симметрично для v6.
+
 Пример:
 ```json
-{ "enabled": true, "whitelistSize": 3 }
+{
+  "enabled": true,
+  "whitelistSize": 3,
+  "whitelistSizeV6": 0,
+  "ipv6Enabled": true,
+  "diagnostics": {
+    "v4Rule": true,
+    "v6Rule": false,
+    "v4SetSize": 3,
+    "v6SetSize": 0
+  }
+}
 ```
 
 **Ошибки**:
@@ -614,8 +654,8 @@ backend node1
 
 ## Как работает Lockdown API
 
-См. подробный архитектурный документ [`LOCKDOWN_WHITELIST.md`](./LOCKDOWN_WHITELIST.md)
-и план реализации [`LOCKDOWN_IMPLEMENTATION.md`](./LOCKDOWN_IMPLEMENTATION.md).
+Реализация: см. `src/lockdown/lockdown.service.ts` (atomic swap через ipset
+restore, mutex для конкурентных enable/addIps, IPv6-семейство `vless_lockdown6`).
 
 Кратко:
 - `ipset vless_lockdown` (`hash:net`) хранит разрешённые IP/CIDR

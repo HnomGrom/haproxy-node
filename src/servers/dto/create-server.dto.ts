@@ -1,7 +1,7 @@
 import { IsIP, IsInt, Max, Min } from 'class-validator';
 
 export class CreateServerDto {
-  @IsIP()
+  @IsIP('4')
   ip: string;
 
   @IsInt()

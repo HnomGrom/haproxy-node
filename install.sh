@@ -31,8 +31,12 @@ if ! command -v apt-get &>/dev/null; then
 fi
 
 # ───────────────────────── Prompt config ──────────────────
-read -rp "API key for the service: " API_KEY
+# -s: ключ не печатается в терминале (история, scrollback, screen-recording).
+# Пустая строка после prompt'а компенсирует отсутствие \n при -s.
+read -rsp "API key for the service: " API_KEY
+echo
 [[ -n "$API_KEY" ]] || err "API key cannot be empty"
+[[ ${#API_KEY} -ge 8 ]] || err "API key must be ≥8 characters (Joi-валидация на старте сервиса требует это же)"
 
 read -rp "API port [3000]: " API_PORT
 API_PORT="${API_PORT:-3000}"
@@ -102,12 +106,14 @@ if [[ -d "$APP_DIR/.git" ]]; then
   cd "$APP_DIR"
   git fetch --all --prune || true
   # Если нужная ветка уже локально — switch, иначе создаём локальную от origin/<branch>
+  # err при failure: продолжать install на старой ветке тихо опасно (можно
+  # незаметно остаться на устаревшем коде).
   if git show-ref --verify --quiet "refs/heads/${REPO_BRANCH}"; then
-    git checkout "${REPO_BRANCH}" || warn "git checkout ${REPO_BRANCH} failed"
+    git checkout "${REPO_BRANCH}" || err "git checkout ${REPO_BRANCH} failed (есть локальные изменения? разреши вручную)"
   else
-    git checkout -B "${REPO_BRANCH}" "origin/${REPO_BRANCH}" || warn "branch ${REPO_BRANCH} not found on remote"
+    git checkout -B "${REPO_BRANCH}" "origin/${REPO_BRANCH}" || err "branch ${REPO_BRANCH} not found on remote"
   fi
-  git pull --ff-only origin "${REPO_BRANCH}" || warn "git pull failed (possibly divergent history — check manually)"
+  git pull --ff-only origin "${REPO_BRANCH}" || err "git pull failed (divergent history — разреши вручную)"
 else
   log "Cloning repository (branch: ${REPO_BRANCH})..."
   rm -rf "$APP_DIR"
@@ -118,7 +124,9 @@ fi
 
 # ───────────────────────── Create .env ────────────────────
 log "Writing .env..."
-cat > .env <<EOF
+# umask 077 → файл создаётся с 0600 (rw-------). Без этого default umask 022
+# даёт 0644 и API_KEY читаем любым пользователем системы.
+(umask 077; cat > .env <<EOF
 DATABASE_URL="file:./dev.db"
 API_KEY="${API_KEY}"
 HAPROXY_CONFIG_PATH="/etc/haproxy/haproxy.cfg"
@@ -130,6 +138,9 @@ API_ALLOWED_IPS_V6="${API_ALLOWED_IPS_V6}"
 SSH_ALLOWED_IPS="${SSH_ALLOWED_IPS}"
 SSH_ALLOWED_IPS_V6="${SSH_ALLOWED_IPS_V6}"
 EOF
+)
+chown root:root .env
+chmod 600 .env
 
 # ───────────────────────── Install & build ────────────────
 log "Installing npm dependencies..."
@@ -150,9 +161,20 @@ log "Syncing database schema..."
 # `db push` читает schema.prisma напрямую и приводит БД в соответствие —
 # идемпотентно, безопасно для additive-изменений. --accept-data-loss нужен
 # чтобы скрипт не висел на prompt'е, если бы вдруг потребовалось удалить столбец.
-#
-# В Prisma 7.x у `db push` нет флага --skip-generate — клиент перегенерится
-# повторно (~100ms, не критично).
+
+# Pre-check: новый @@unique([ip, backendPort]) constraint в Server упадёт,
+# если в существующей БД уже есть дубли (тот самый legacy-баг — два сервера
+# с одинаковым IP). Detect & report ДО `db push` — иначе оператор получит
+# непонятный "UNIQUE constraint failed" без указания на конкретные строки.
+if [ -f "${APP_DIR}/dev.db" ] && command -v sqlite3 &>/dev/null; then
+  DUPS=$(sqlite3 "${APP_DIR}/dev.db" "SELECT ip, backendPort, COUNT(*) c FROM Server GROUP BY ip, backendPort HAVING c > 1;" 2>/dev/null || true)
+  if [ -n "${DUPS}" ]; then
+    warn "В БД найдены дубликаты (ip, backendPort) — миграция упадёт на @@unique:"
+    echo "${DUPS}" | sed 's/^/    /'
+    err "Удали дубли вручную: sqlite3 ${APP_DIR}/dev.db \"DELETE FROM Server WHERE id NOT IN (SELECT MIN(id) FROM Server GROUP BY ip, backendPort);\""
+  fi
+fi
+
 cd "${APP_DIR}" && npx prisma db push --accept-data-loss \
   || err "Prisma db push failed — БД схема не синхронизирована с schema.prisma"
 
@@ -227,9 +249,9 @@ sysctl --system >/dev/null 2>&1 || warn "sysctl --system returned non-zero (non-
 # это делало HAProxy мишенью для сканеров. Теперь неизвестные порты дропаются
 # policy INPUT DROP. Чистим старую цепочку если осталась.
 log "Removing legacy NAT fallback chain (if exists)..."
-iptables -t nat -D PREROUTING -p tcp -j HAPROXY_FALLBACK 2>/dev/null || true
-iptables -t nat -F HAPROXY_FALLBACK 2>/dev/null || true
-iptables -t nat -X HAPROXY_FALLBACK 2>/dev/null || true
+iptables -w 5 -t nat -D PREROUTING -p tcp -j HAPROXY_FALLBACK 2>/dev/null || true
+iptables -w 5 -t nat -F HAPROXY_FALLBACK 2>/dev/null || true
+iptables -w 5 -t nat -X HAPROXY_FALLBACK 2>/dev/null || true
 
 # ───────────────────────── Install ipset + persistence ───
 # ipset нужен всегда (для vless_lockdown + api/ssh whitelist).
@@ -249,12 +271,34 @@ if ! dpkg -s ipset-persistent >/dev/null 2>&1; then
     warn "ipset-persistent package not available — ipsets могут не восстановиться после reboot"
 fi
 
+# ───────────────────────── ipset helpers ────────────────────
+# Пересоздать set, если он существует с НЕправильным типом или family.
+# `ipset create -exist` молча оставляет старый type/family — в результате
+# `ipset add CIDR` падает Syntax error на set'ах с hash:ip.
+# Аргументы: $1=name $2=expected-type $3=expected-family ($4...)=create-args
+ensure_ipset() {
+  local name="$1" expected_type="$2" expected_family="$3"
+  shift 3
+  local actual_type actual_family
+  actual_type=$(ipset list "$name" 2>/dev/null | awk -F': ' '/^Type/ {print $2; exit}' || true)
+  # Header line: "Header: family inet hashsize 65536 maxelem ...". Без -F
+  # awk использует whitespace, $2="family" $3="inet". С -F': ' family-token
+  # сидит внутри $2 и не извлекается прямым $(i+1).
+  actual_family=$(ipset list "$name" 2>/dev/null | awk '/^Header/ {for(i=1;i<=NF;i++) if($i=="family") {print $(i+1); exit}}' || true)
+  if [ -n "$actual_type" ] && { [ "$actual_type" != "$expected_type" ] || \
+       { [ -n "$actual_family" ] && [ "$actual_family" != "$expected_family" ]; }; }; then
+    warn "  ipset $name has type=$actual_type family=$actual_family (expected $expected_type/$expected_family) — recreating"
+    ipset destroy "$name" 2>/dev/null || true
+  fi
+  ipset create "$name" "$@" -exist
+}
+
 # ───────────────────────── API whitelist (ipset) ──────────
 if [ -n "${API_ALLOWED_IPS}" ]; then
   log "Configuring API whitelist for :${API_PORT}..."
-  ipset create api_whitelist hash:net maxelem 128 2>/dev/null || true
+  # `-i lo -j ACCEPT` уже покрывает loopback — не дублируем 127.0.0.1 в set.
+  ensure_ipset api_whitelist hash:net inet hash:net family inet maxelem 128
   ipset flush api_whitelist
-  ipset add api_whitelist 127.0.0.1 2>/dev/null || true
   IFS=',' read -ra _IPS <<< "${API_ALLOWED_IPS//[[:space:]]/}"
   for ip in "${_IPS[@]}"; do
     [ -z "$ip" ] && continue
@@ -269,7 +313,7 @@ fi
 # ───────────────────────── SSH whitelist (ipset) ──────────
 if [ -n "${SSH_ALLOWED_IPS}" ]; then
   log "Configuring SSH whitelist for :22..."
-  ipset create ssh_whitelist hash:net maxelem 128 2>/dev/null || true
+  ensure_ipset ssh_whitelist hash:net inet hash:net family inet maxelem 128
   ipset flush ssh_whitelist
   IFS=',' read -ra _IPS <<< "${SSH_ALLOWED_IPS//[[:space:]]/}"
   for ip in "${_IPS[@]}"; do
@@ -285,47 +329,56 @@ fi
 # ───────────────────────── INPUT Lockdown (policy DROP) ───
 log "Lockdown: rebuilding INPUT chain with policy DROP..."
 
-# Policy ACCEPT перед flush — не разрываем SSH при переустановке
-iptables -P INPUT ACCEPT
-iptables -P FORWARD ACCEPT
-iptables -F INPUT
+# Backup текущих правил перед flush — operator-safe re-install. Сохраняем
+# отдельно от netfilter-persistent (rules.v4), чтобы можно было вернуть
+# именно "до запуска install.sh" состояние.
+BACKUP_TS=$(date +%Y%m%d-%H%M%S)
+mkdir -p /root/.haproxy-node-backups
+iptables-save > "/root/.haproxy-node-backups/iptables.${BACKUP_TS}" 2>/dev/null || true
+log "  iptables backup: /root/.haproxy-node-backups/iptables.${BACKUP_TS}"
+
+# Policy ACCEPT перед flush — не разрываем SSH при переустановке.
+# `-w 5` ждёт xtables-lock до 5с (избегаем race с fail2ban/docker).
+iptables -w 5 -P INPUT ACCEPT
+iptables -w 5 -P FORWARD ACCEPT
+iptables -w 5 -F INPUT
 
 # 1. Loopback + ESTABLISHED/INVALID
-iptables -A INPUT -i lo -j ACCEPT
-iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
+iptables -w 5 -A INPUT -i lo -j ACCEPT
+iptables -w 5 -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -w 5 -A INPUT -m conntrack --ctstate INVALID -j DROP
 
 # 2. SSH — whitelist или rate-limit
 if [ -n "${SSH_ALLOWED_IPS}" ]; then
-  iptables -A INPUT -p tcp --dport 22 -m set --match-set ssh_whitelist src -j ACCEPT
+  iptables -w 5 -A INPUT -p tcp --dport 22 -m set --match-set ssh_whitelist src -j ACCEPT
   log "  ACCEPT :22 только для ssh_whitelist"
 else
-  iptables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW \
+  iptables -w 5 -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW \
     -m recent --set --name SSH --rsource
-  iptables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW \
+  iptables -w 5 -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW \
     -m recent --update --seconds 60 --hitcount 4 --name SSH --rsource -j DROP
-  iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+  iptables -w 5 -A INPUT -p tcp --dport 22 -j ACCEPT
   log "  ACCEPT :22 всем с rate-limit (4/60s)"
 fi
 
 # 3. API — только для api_whitelist
 if [ -n "${API_ALLOWED_IPS}" ]; then
-  iptables -A INPUT -p tcp --dport ${API_PORT} -m set --match-set api_whitelist src -j ACCEPT
+  iptables -w 5 -A INPUT -p tcp --dport ${API_PORT} -m set --match-set api_whitelist src -j ACCEPT
   log "  ACCEPT :${API_PORT} только для api_whitelist"
 else
   warn "  :${API_PORT} API ЗАКРЫТ (нет API_ALLOWED_IPS)"
 fi
 
 # 4. VLESS frontend-диапазон
-iptables -A INPUT -p tcp -m multiport --dports ${PORT_MIN}:${PORT_MAX} -j ACCEPT
+iptables -w 5 -A INPUT -p tcp -m multiport --dports ${PORT_MIN}:${PORT_MAX} -j ACCEPT
 
 # 5. ICMP с rate-limit
-iptables -A INPUT -p icmp -m limit --limit 5/s --limit-burst 10 -j ACCEPT
+iptables -w 5 -A INPUT -p icmp -m limit --limit 5/s --limit-burst 10 -j ACCEPT
 
 # 6. Policy DROP — всё остальное в чёрную дыру
-iptables -P INPUT DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT ACCEPT
+iptables -w 5 -P INPUT DROP
+iptables -w 5 -P FORWARD DROP
+iptables -w 5 -P OUTPUT ACCEPT
 
 log "INPUT policy DROP активна. Открыто: :22, :${PORT_MIN}-${PORT_MAX}"
 [ -n "${API_ALLOWED_IPS}" ] && log "  + :${API_PORT} для whitelist"
@@ -335,8 +388,17 @@ log "INPUT policy DROP активна. Открыто: :22, :${PORT_MIN}-${PORT_
 # reboot восстановится старое состояние (возможно policy ACCEPT), а мы снова
 # окажемся без защиты. Финальное `netfilter-persistent save` в конце всё равно
 # перезапишет это актуальными правилами.
+#
+# Атомарная запись через tmp+rename: при SIGKILL/ENOSPC/OOM прямой `>` оставит
+# усечённый файл, и iptables-restore при boot'е упадёт.
 mkdir -p /etc/iptables
-iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+TMP_V4=$(mktemp /etc/iptables/rules.v4.XXXXXX)
+if iptables-save > "$TMP_V4" 2>/dev/null && [ -s "$TMP_V4" ]; then
+  mv "$TMP_V4" /etc/iptables/rules.v4
+else
+  rm -f "$TMP_V4"
+  warn "iptables-save (early) failed — rules.v4 не обновлён"
+fi
 
 # ───────────────────────── IPv6 Lockdown ──────────────────
 IPV6_ENABLED=false
@@ -347,11 +409,14 @@ fi
 if [ "${IPV6_ENABLED}" = "true" ]; then
   log "IPv6 активен — применяю lockdown ip6tables..."
 
+  # Backup существующих v6-правил
+  ip6tables-save > "/root/.haproxy-node-backups/ip6tables.${BACKUP_TS}" 2>/dev/null || true
+
   # API v6 whitelist
   if [ -n "${API_ALLOWED_IPS_V6}" ]; then
-    ipset create api_whitelist6 hash:net family inet6 maxelem 128 2>/dev/null || true
+    # `-i lo -j ACCEPT` уже покрывает ::1 — не дублируем в set.
+    ensure_ipset api_whitelist6 hash:net inet6 hash:net family inet6 maxelem 128
     ipset flush api_whitelist6
-    ipset add api_whitelist6 ::1 2>/dev/null || true
     IFS=',' read -ra _IPS <<< "${API_ALLOWED_IPS_V6//[[:space:]]/}"
     for ip in "${_IPS[@]}"; do
       [ -z "$ip" ] && continue
@@ -361,7 +426,7 @@ if [ "${IPV6_ENABLED}" = "true" ]; then
 
   # SSH v6 whitelist
   if [ -n "${SSH_ALLOWED_IPS_V6}" ]; then
-    ipset create ssh_whitelist6 hash:net family inet6 maxelem 128 2>/dev/null || true
+    ensure_ipset ssh_whitelist6 hash:net inet6 hash:net family inet6 maxelem 128
     ipset flush ssh_whitelist6
     IFS=',' read -ra _IPS <<< "${SSH_ALLOWED_IPS_V6//[[:space:]]/}"
     for ip in "${_IPS[@]}"; do
@@ -370,59 +435,79 @@ if [ "${IPV6_ENABLED}" = "true" ]; then
     done
   fi
 
+  # vless_lockdown6 ipset (hash:net family inet6) — match-set на VLESS-портах
+  # для IPv6. Без этого set'а ip6tables -m set --match-set падает и lockdown
+  # для IPv6 неактивен → атака идёт через v6 мимо IPv4 защиты.
+  # ensure_ipset снимет ip6tables match-set правило (если есть) и пересоздаст
+  # set если type/family не совпадает.
+  EXISTING_TYPE6=$(ipset list vless_lockdown6 2>/dev/null | awk -F': ' '/^Type/ {print $2; exit}' || true)
+  if [ -n "$EXISTING_TYPE6" ] && [ "$EXISTING_TYPE6" != "hash:net" ]; then
+    ip6tables -w 5 -D INPUT -p tcp -m multiport --dports ${PORT_MIN}:${PORT_MAX} \
+      -m set --match-set vless_lockdown6 src -j ACCEPT 2>/dev/null || true
+  fi
+  ensure_ipset vless_lockdown6 hash:net inet6 hash:net family inet6 maxelem 1000000 hashsize 65536
+
   # Policy ACCEPT перед flush — не разрываем IPv6 SSH при переустановке
-  ip6tables -P INPUT ACCEPT
-  ip6tables -P FORWARD ACCEPT
-  ip6tables -F INPUT
+  ip6tables -w 5 -P INPUT ACCEPT
+  ip6tables -w 5 -P FORWARD ACCEPT
+  ip6tables -w 5 -F INPUT
 
   # 1. Loopback + ESTABLISHED/INVALID
-  ip6tables -A INPUT -i lo -j ACCEPT
-  ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  ip6tables -A INPUT -m conntrack --ctstate INVALID -j DROP
+  ip6tables -w 5 -A INPUT -i lo -j ACCEPT
+  ip6tables -w 5 -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  ip6tables -w 5 -A INPUT -m conntrack --ctstate INVALID -j DROP
 
   # 2. ICMPv6 — КРИТИЧНО, без этого IPv6 сеть сломается (NDP/RA/PMTU)
-  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type neighbor-solicitation -j ACCEPT
-  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type neighbor-advertisement -j ACCEPT
-  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type router-solicitation -j ACCEPT
-  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type router-advertisement -j ACCEPT
-  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type packet-too-big -j ACCEPT
-  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type destination-unreachable -j ACCEPT
-  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type parameter-problem -j ACCEPT
-  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type time-exceeded -j ACCEPT
+  ip6tables -w 5 -A INPUT -p ipv6-icmp --icmpv6-type neighbor-solicitation -j ACCEPT
+  ip6tables -w 5 -A INPUT -p ipv6-icmp --icmpv6-type neighbor-advertisement -j ACCEPT
+  ip6tables -w 5 -A INPUT -p ipv6-icmp --icmpv6-type router-solicitation -j ACCEPT
+  ip6tables -w 5 -A INPUT -p ipv6-icmp --icmpv6-type router-advertisement -j ACCEPT
+  ip6tables -w 5 -A INPUT -p ipv6-icmp --icmpv6-type packet-too-big -j ACCEPT
+  ip6tables -w 5 -A INPUT -p ipv6-icmp --icmpv6-type destination-unreachable -j ACCEPT
+  ip6tables -w 5 -A INPUT -p ipv6-icmp --icmpv6-type parameter-problem -j ACCEPT
+  ip6tables -w 5 -A INPUT -p ipv6-icmp --icmpv6-type time-exceeded -j ACCEPT
   # echo-request (ping6) — с rate-limit
-  ip6tables -A INPUT -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 5/s -j ACCEPT
+  ip6tables -w 5 -A INPUT -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 5/s -j ACCEPT
 
   # 3. SSH — whitelist или rate-limit
   if [ -n "${SSH_ALLOWED_IPS_V6}" ]; then
-    ip6tables -A INPUT -p tcp --dport 22 -m set --match-set ssh_whitelist6 src -j ACCEPT
+    ip6tables -w 5 -A INPUT -p tcp --dport 22 -m set --match-set ssh_whitelist6 src -j ACCEPT
     log "  ACCEPT :22 (v6) только для ssh_whitelist6"
   else
-    ip6tables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW \
+    ip6tables -w 5 -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW \
       -m recent --set --name SSH6 --rsource
-    ip6tables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW \
+    ip6tables -w 5 -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW \
       -m recent --update --seconds 60 --hitcount 4 --name SSH6 --rsource -j DROP
-    ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT
+    ip6tables -w 5 -A INPUT -p tcp --dport 22 -j ACCEPT
     log "  ACCEPT :22 (v6) всем с rate-limit (4/60s)"
   fi
 
   # 4. API v6 — только для api_whitelist6
   if [ -n "${API_ALLOWED_IPS_V6}" ]; then
-    ip6tables -A INPUT -p tcp --dport ${API_PORT} -m set --match-set api_whitelist6 src -j ACCEPT
+    ip6tables -w 5 -A INPUT -p tcp --dport ${API_PORT} -m set --match-set api_whitelist6 src -j ACCEPT
     log "  ACCEPT :${API_PORT} (v6) только для api_whitelist6"
   fi
 
-  # 5. VLESS frontend-диапазон
-  ip6tables -A INPUT -p tcp -m multiport --dports ${PORT_MIN}:${PORT_MAX} -j ACCEPT
+  # 5. VLESS frontend-диапазон — ACCEPT по умолчанию (lockdown.service.ts
+  # сам поднимет match-set vless_lockdown6 правило ПЕРЕД этим ACCEPT
+  # при enable() и снимет это ACCEPT, если активен lockdown).
+  ip6tables -w 5 -A INPUT -p tcp -m multiport --dports ${PORT_MIN}:${PORT_MAX} -j ACCEPT
 
   # 6. Policy DROP
-  ip6tables -P INPUT DROP
-  ip6tables -P FORWARD DROP
-  ip6tables -P OUTPUT ACCEPT
+  ip6tables -w 5 -P INPUT DROP
+  ip6tables -w 5 -P FORWARD DROP
+  ip6tables -w 5 -P OUTPUT ACCEPT
 
-  log "IPv6 INPUT policy DROP активна"
+  log "IPv6 INPUT policy DROP активна (lockdown6 ipset готов)"
 
-  # Раннее сохранение v6 (см. комментарий у IPv4 выше)
-  ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+  # Раннее сохранение v6 (см. комментарий у IPv4 выше) — atomic.
+  TMP_V6=$(mktemp /etc/iptables/rules.v6.XXXXXX)
+  if ip6tables-save > "$TMP_V6" 2>/dev/null && [ -s "$TMP_V6" ]; then
+    mv "$TMP_V6" /etc/iptables/rules.v6
+  else
+    rm -f "$TMP_V6"
+    warn "ip6tables-save (early) failed — rules.v6 не обновлён"
+  fi
 else
   warn "IPv6 не активен на сервере (ip6tables недоступен) — пропускаю IPv6 защиту"
 fi
@@ -438,22 +523,38 @@ log "Ensuring vless_lockdown ipset (hash:net)..."
 #      без `head -n1`, который провоцирует SIGPIPE и exit=141 под pipefail.
 EXISTING_TYPE=$(ipset list vless_lockdown 2>/dev/null | awk -F': ' '/^Type/ {print $2; exit}' || true)
 if [ -n "$EXISTING_TYPE" ] && [ "$EXISTING_TYPE" != "hash:net" ]; then
-  warn "Found vless_lockdown with wrong type ($EXISTING_TYPE) — recreating as hash:net"
   # Снять iptables-правила, ссылающиеся на set (иначе destroy падает "in use")
-  iptables -D INPUT -p tcp -m multiport --dports ${PORT_MIN}:${PORT_MAX} \
+  iptables -w 5 -D INPUT -p tcp -m multiport --dports ${PORT_MIN}:${PORT_MAX} \
     -m set --match-set vless_lockdown src -j ACCEPT 2>/dev/null || true
-  ipset destroy vless_lockdown
 fi
-ipset create vless_lockdown hash:net maxelem 1000000 hashsize 65536 family inet -exist
+ensure_ipset vless_lockdown hash:net inet hash:net maxelem 1000000 hashsize 65536 family inet
 
 FINAL_TYPE=$(ipset list vless_lockdown | awk -F': ' '/^Type/ {print $2; exit}' || true)
 if [ "$FINAL_TYPE" != "hash:net" ]; then
   err "vless_lockdown has type '$FINAL_TYPE', expected hash:net"
 fi
 
+# Если в vless_lockdown накопились IP — предыдущая установка имела активный
+# lockdown. После flush'а INPUT match-set правило снято, оператор должен
+# явно вернуть его через POST /lockdown/on. Ipset-данные сохранены.
+LOCKDOWN_SIZE=$(ipset list -t vless_lockdown 2>/dev/null | awk -F': ' '/Number of entries/ {print $2; exit}' | tr -d '[:space:]')
+if [[ "${LOCKDOWN_SIZE:-0}" =~ ^[0-9]+$ ]] && [ "${LOCKDOWN_SIZE}" -gt 0 ]; then
+  warn "vless_lockdown содержит ${LOCKDOWN_SIZE} записей, но match-set правило снято install.sh-ом"
+  warn "  → вызовите POST /lockdown/on с актуальным whitelist'ом, чтобы lockdown снова стал активным"
+fi
+
 # ───────────────────────── ipset persistence ──────────────
-# Сохранить все ipsets (api_whitelist, ssh_whitelist, vless_lockdown, *6) в /etc/ipset.conf
-ipset save > /etc/ipset.conf 2>/dev/null || true
+# Сохранить все ipsets (api_whitelist, ssh_whitelist, vless_lockdown, *6) в
+# /etc/ipset.conf через атомарный rename (defense против частичной записи
+# при SIGKILL/ENOSPC: на boot'е ipset-persistent читает повреждённый файл,
+# падает, и iptables-restore тоже падает на match-set без set'а).
+TMP_IPSET=$(mktemp /etc/ipset.conf.XXXXXX)
+if ipset save > "$TMP_IPSET" 2>/dev/null && [ -s "$TMP_IPSET" ]; then
+  mv "$TMP_IPSET" /etc/ipset.conf
+else
+  rm -f "$TMP_IPSET"
+  warn "ipset save failed — /etc/ipset.conf не обновлён"
+fi
 
 # Fallback для старых ifupdown систем (Debian pre-systemd-networkd).
 # На современных Ubuntu/netplan не срабатывает — нужен ipset-persistent плагин.
@@ -473,11 +574,14 @@ if ! command -v netfilter-persistent &>/dev/null; then
 fi
 
 # Плагины netfilter-persistent запускаются в алфавитном порядке.
-# ipset-plugin (по умолчанию может быть назван 10-ipset или 25-ipset и т.д.)
-# должен выполниться ДО iptables-plugin (обычно 15-iptables), иначе
-# iptables-restore падает на правилах с --match-set (set'а ещё нет).
-# Переименовываем plugin'ы: iptables становится 50-*, ip6tables 55-*,
-# чтобы любой реально установленный ipset-плагин (05/10/25/45) отработал раньше.
+# ipset-plugin (по умолчанию может быть назван 10-ipset / 15-ipset / 25-ipset
+# в зависимости от версии пакета ipset-persistent) должен выполниться ДО
+# iptables-plugin (типично 15-iptables) и ip6tables-plugin (25-ip6tables),
+# иначе iptables-restore падает на правилах с --match-set (set'а ещё нет).
+#
+# Достаточно поднять только ipset в префикс 05-* — он гарантированно
+# выполнится раньше любого *-iptables (минимум 10) и *-ip6tables (минимум 20).
+# Переименование iptables/ip6tables плагинов не требуется.
 PLUGINS_DIR="/usr/share/netfilter-persistent/plugins.d"
 if [ -d "${PLUGINS_DIR}" ]; then
   # ipset-плагин в приоритет — префикс 05
