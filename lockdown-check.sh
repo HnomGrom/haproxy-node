@@ -77,11 +77,15 @@ else
       inc_crit
     fi
 
-    if [ "${SIZE:-0}" -gt 0 ]; then
+    # Defensive: если awk вернул non-digit (формат вывода поменялся), bash
+    # `-gt` упадёт с error. Сначала проверяем что SIZE — целое число.
+    if [[ "${SIZE:-}" =~ ^[0-9]+$ ]] && [ "${SIZE}" -gt 0 ]; then
       ok  "записей: ${SIZE}"
-    else
+    elif [[ "${SIZE:-}" =~ ^[0-9]+$ ]]; then
       crit "записей: 0 — при активном lockdown ВСЕ клиенты дропаются"
       inc_crit
+    else
+      warn "не удалось распарсить размер ipset (raw='${SIZE:-}') — формат ipset list изменился?"
     fi
 
     echo "   первые 5 записей:"

@@ -17,7 +17,8 @@ export class HaproxyService {
     private readonly config: ConfigService,
     private readonly iptables: IptablesService,
   ) {
-    this.configPath = this.config.get<string>('HAPROXY_CONFIG_PATH');
+    // Joi-валидация в AppModule гарантирует наличие переменной (default '/etc/haproxy/haproxy.cfg').
+    this.configPath = this.config.get<string>('HAPROXY_CONFIG_PATH')!;
   }
 
   buildConfig(servers: Server[]): string {
@@ -44,18 +45,24 @@ export class HaproxyService {
         `frontend ${server.name}_in`,
         `    bind *:${server.frontendPort}`,
         '    mode tcp',
+        // inspect-delay + reject if !TLS-hello: не-TLS-сканеры (типа masscan)
+        // получают reject, не съедают backend-коннект и не светят backend
+        // через 5-секундный hang. accept TLS-hello — сразу маршрутизация.
         '    tcp-request inspect-delay 5s',
+        '    tcp-request content reject if !{ req.ssl_hello_type 1 }',
         '    tcp-request content accept if { req.ssl_hello_type 1 }',
         `    default_backend ${server.name}`,
       );
     }
 
     for (const server of servers) {
+      // check inter 5s rise 1 fall 2: 10 сек до UP (вместо 60с при rise 2 inter 30s).
+      // Оператор не успевает подумать "не работает" пока backend поднимается.
       lines.push(
         '',
         `backend ${server.name}`,
         '    mode tcp',
-        `    server s_${server.id} ${server.ip}:${server.backendPort} check inter 30s fall 3 rise 2`,
+        `    server s_${server.id} ${server.ip}:${server.backendPort} check inter 5s fall 2 rise 1`,
       );
     }
 

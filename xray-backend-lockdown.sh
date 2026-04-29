@@ -78,17 +78,31 @@ fi
 # ═════════════════════════════════════════════════════════════════
 #  АВТОДОБАВЛЕНИЕ ТЕКУЩЕГО SSH IP (защита от самоблокировки)
 # ═════════════════════════════════════════════════════════════════
+# Helper: членство $1 в массиве, имя которого передано как $2.
+# Безопаснее `[[ " ${arr[*]:-} " =~ " $val " ]]` — последнее ломается на
+# пустом массиве + set -u и false-positive для подстрок (192.168.1.1
+# матчится в "192.168.1.10").
+in_array() {
+  local needle="$1"
+  local -n arr_ref="$2"
+  local item
+  for item in "${arr_ref[@]:-}"; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
 if [ -n "${SSH_CLIENT:-}" ]; then
   CUR="${SSH_CLIENT%% *}"
   if [[ "$CUR" == *:* ]]; then
     # IPv6
-    if [[ ! " ${IPS_V6[*]:-} " =~ " ${CUR} " ]]; then
+    if ! in_array "$CUR" IPS_V6; then
       IPS_V6+=("$CUR")
       log "Auto-added IPv6 SSH: $CUR"
     fi
   else
     # IPv4
-    if [[ ! " ${IPS_V4[*]} " =~ " ${CUR} " ]]; then
+    if ! in_array "$CUR" IPS_V4; then
       IPS_V4+=("$CUR")
       log "Auto-added IPv4 SSH: $CUR"
     fi

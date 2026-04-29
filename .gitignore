@@ -8,3 +8,8 @@ dist
 /docs
 result
 /prisma/migrations
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key
+.beads
