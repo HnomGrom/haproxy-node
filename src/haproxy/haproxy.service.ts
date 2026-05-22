@@ -21,7 +21,9 @@ export class HaproxyService {
     private readonly iptables: IptablesService,
     private readonly crowdsec: CrowdsecService,
   ) {
-    this.configPath = this.config.get<string>('HAPROXY_CONFIG_PATH');
+    this.configPath =
+      this.config.get<string>('HAPROXY_CONFIG_PATH') ??
+      '/etc/haproxy/haproxy.cfg';
     const rawSni = this.config.get<string>('ALLOWED_SNI', '') || '';
     this.allowedSniList = rawSni
       .split(',')
