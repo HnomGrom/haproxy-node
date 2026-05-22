@@ -3,6 +3,12 @@ set -euo pipefail
 
 APP_DIR="/opt/haproxy-node"
 REPO_URL="https://github.com/HnomGrom/haproxy-node.git"
+# Ветка по умолчанию — main. Переопределяется env-переменной (REPO_BRANCH или
+# короткий alias BRANCH) либо интерактивным prompt'ом ниже.
+# Примеры:
+#   REPO_BRANCH=develop bash install.sh
+#   BRANCH=develop bash install.sh
+REPO_BRANCH_DEFAULT="${REPO_BRANCH:-${BRANCH:-main}}"
 SERVICE_NAME="haproxy-node"
 NODE_MAJOR=22
 
@@ -25,8 +31,12 @@ if ! command -v apt-get &>/dev/null; then
 fi
 
 # ───────────────────────── Prompt config ──────────────────
-read -rp "API key for the service: " API_KEY
+# -s: ключ не печатается в терминале (история, scrollback, screen-recording).
+# Пустая строка после prompt'а компенсирует отсутствие \n при -s.
+read -rsp "API key for the service: " API_KEY
+echo
 [[ -n "$API_KEY" ]] || err "API key cannot be empty"
+[[ ${#API_KEY} -ge 8 ]] || err "API key must be ≥8 characters (Joi-валидация на старте сервиса требует это же)"
 
 read -rp "API port [3000]: " API_PORT
 API_PORT="${API_PORT:-3000}"
@@ -37,8 +47,42 @@ PORT_MIN="${PORT_MIN:-10000}"
 read -rp "Frontend port range max [65000]: " PORT_MAX
 PORT_MAX="${PORT_MAX:-65000}"
 
-read -rp "Fallback error page port [59999]: " FALLBACK_PORT
-FALLBACK_PORT="${FALLBACK_PORT:-59999}"
+read -rp "Git branch [${REPO_BRANCH_DEFAULT}]: " REPO_BRANCH
+REPO_BRANCH="${REPO_BRANCH:-${REPO_BRANCH_DEFAULT}}"
+
+# IP, которым разрешён доступ к API (:${API_PORT}) через запятую.
+# Пусто = API ЗАКРЫТ (только с localhost).
+read -rp "IPv4 (через запятую) с доступом к API [пусто = закрыт]: " API_ALLOWED_IPS
+read -rp "IPv6 (через запятую) с доступом к API [пусто = нет]: " API_ALLOWED_IPS_V6
+
+# IP, которым разрешён SSH. Пусто = все (с rate-limit 4/мин).
+read -rp "IPv4 (через запятую) с доступом к SSH :22 [пусто = все]: " SSH_ALLOWED_IPS
+read -rp "IPv6 (через запятую) с доступом к SSH [пусто = все]: " SSH_ALLOWED_IPS_V6
+
+# Защита от самоблокировки: автоматически добавить текущий SSH IP
+# (в IPv4 или IPv6 whitelist — в зависимости от протокола текущей сессии)
+CUR_SSH_IP=""
+if [ -n "${SSH_CLIENT:-}" ]; then
+  CUR_SSH_IP="${SSH_CLIENT%% *}"
+elif [ -n "${SSH_CONNECTION:-}" ]; then
+  CUR_SSH_IP="${SSH_CONNECTION%% *}"
+fi
+
+if [ -n "${CUR_SSH_IP}" ]; then
+  if [[ "${CUR_SSH_IP}" == *:* ]]; then
+    # IPv6
+    if [ -n "${SSH_ALLOWED_IPS_V6}" ] && ! echo ",${SSH_ALLOWED_IPS_V6}," | grep -q ",${CUR_SSH_IP},"; then
+      warn "Автодобавление текущего IPv6 SSH в whitelist: ${CUR_SSH_IP}"
+      SSH_ALLOWED_IPS_V6="${SSH_ALLOWED_IPS_V6},${CUR_SSH_IP}"
+    fi
+  else
+    # IPv4
+    if [ -n "${SSH_ALLOWED_IPS}" ] && ! echo ",${SSH_ALLOWED_IPS}," | grep -q ",${CUR_SSH_IP},"; then
+      warn "Автодобавление текущего IPv4 SSH в whitelist: ${CUR_SSH_IP}"
+      SSH_ALLOWED_IPS="${SSH_ALLOWED_IPS},${CUR_SSH_IP}"
+    fi
+  fi
+fi
 
 # IP-адреса, которым разрешён доступ к API (через запятую).
 # Пусто = API полностью закрыт (только с localhost).
@@ -105,19 +149,31 @@ fi
 
 # ───────────────────────── Clone project ──────────────────
 if [[ -d "$APP_DIR/.git" ]]; then
-  log "Updating existing installation..."
+  log "Updating existing installation (branch: ${REPO_BRANCH})..."
   cd "$APP_DIR"
-  git pull --ff-only || true
+  git fetch --all --prune || true
+  # Если нужная ветка уже локально — switch, иначе создаём локальную от origin/<branch>
+  # err при failure: продолжать install на старой ветке тихо опасно (можно
+  # незаметно остаться на устаревшем коде).
+  if git show-ref --verify --quiet "refs/heads/${REPO_BRANCH}"; then
+    git checkout "${REPO_BRANCH}" || err "git checkout ${REPO_BRANCH} failed (есть локальные изменения? разреши вручную)"
+  else
+    git checkout -B "${REPO_BRANCH}" "origin/${REPO_BRANCH}" || err "branch ${REPO_BRANCH} not found on remote"
+  fi
+  git pull --ff-only origin "${REPO_BRANCH}" || err "git pull failed (divergent history — разреши вручную)"
 else
-  log "Cloning repository..."
+  log "Cloning repository (branch: ${REPO_BRANCH})..."
   rm -rf "$APP_DIR"
-  git clone "$REPO_URL" "$APP_DIR"
+  git clone --branch "${REPO_BRANCH}" "$REPO_URL" "$APP_DIR" || \
+    err "git clone failed — ветка '${REPO_BRANCH}' существует в ${REPO_URL}?"
   cd "$APP_DIR"
 fi
 
 # ───────────────────────── Create .env ────────────────────
 log "Writing .env..."
-cat > .env <<EOF
+# umask 077 → файл создаётся с 0600 (rw-------). Без этого default umask 022
+# даёт 0644 и API_KEY читаем любым пользователем системы.
+(umask 077; cat > .env <<EOF
 DATABASE_URL="file:./dev.db"
 API_KEY="${API_KEY}"
 HAPROXY_CONFIG_PATH="/etc/haproxy/haproxy.cfg"
@@ -132,6 +188,9 @@ SSH_ALLOWED_IPS_V6="${SSH_ALLOWED_IPS_V6}"
 ALLOWED_SNI="${ALLOWED_SNI}"
 ERROR_PAGE_PATH="/etc/haproxy/errors/503.html"
 EOF
+)
+chown root:root .env
+chmod 600 .env
 
 # ───────────────────────── Install & build ────────────────
 log "Installing npm dependencies..."
@@ -140,8 +199,34 @@ cd "${APP_DIR}" && NODE_ENV=development npm install
 log "Generating Prisma client..."
 cd "${APP_DIR}" && npx prisma generate
 
-log "Running database migrations..."
-cd "${APP_DIR}" && npx prisma migrate deploy
+log "Syncing database schema..."
+# ВАЖНО: используем `db push`, а не `migrate deploy`.
+#
+# Причина: `migrate deploy` применяет ТОЛЬКО миграции, закоммиченные в git
+# (prisma/migrations/*). Если в schema.prisma появилась модель, но соответствующая
+# миграция не закоммичена — таблица в проде не будет создана. Например, раньше
+# при добавлении LockdownEvent таблица не создавалась и /lockdown/on падал с
+# "no such table: LockdownEvent".
+#
+# `db push` читает schema.prisma напрямую и приводит БД в соответствие —
+# идемпотентно, безопасно для additive-изменений. --accept-data-loss нужен
+# чтобы скрипт не висел на prompt'е, если бы вдруг потребовалось удалить столбец.
+
+# Pre-check: новый @@unique([ip, backendPort]) constraint в Server упадёт,
+# если в существующей БД уже есть дубли (тот самый legacy-баг — два сервера
+# с одинаковым IP). Detect & report ДО `db push` — иначе оператор получит
+# непонятный "UNIQUE constraint failed" без указания на конкретные строки.
+if [ -f "${APP_DIR}/dev.db" ] && command -v sqlite3 &>/dev/null; then
+  DUPS=$(sqlite3 "${APP_DIR}/dev.db" "SELECT ip, backendPort, COUNT(*) c FROM Server GROUP BY ip, backendPort HAVING c > 1;" 2>/dev/null || true)
+  if [ -n "${DUPS}" ]; then
+    warn "В БД найдены дубликаты (ip, backendPort) — миграция упадёт на @@unique:"
+    echo "${DUPS}" | sed 's/^/    /'
+    err "Удали дубли вручную: sqlite3 ${APP_DIR}/dev.db \"DELETE FROM Server WHERE id NOT IN (SELECT MIN(id) FROM Server GROUP BY ip, backendPort);\""
+  fi
+fi
+
+cd "${APP_DIR}" && npx prisma db push --accept-data-loss \
+  || err "Prisma db push failed — БД схема не синхронизирована с schema.prisma"
 
 log "Building application..."
 cd "${APP_DIR}"
@@ -149,11 +234,6 @@ rm -rf "${APP_DIR}/dist"
 ./node_modules/.bin/tsc -p tsconfig.build.json || err "TypeScript compilation failed"
 [[ -f "${APP_DIR}/dist/src/main.js" ]] || err "Build failed — dist/src/main.js not found"
 log "Build successful"
-
-# ───────────────────────── Error page ─────────────────────
-log "Installing error page..."
-mkdir -p /etc/haproxy/errors
-cp "${APP_DIR}/src/haproxy/error-pages/503.html" /etc/haproxy/errors/503.html
 
 # ───────────────────────── HAProxy initial config ─────────
 if [[ ! -f /etc/haproxy/haproxy.cfg.original ]]; then
@@ -558,7 +638,7 @@ if ! command -v netfilter-persistent &>/dev/null; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent
 fi
 if command -v netfilter-persistent &>/dev/null; then
-  netfilter-persistent save
+  netfilter-persistent save >/dev/null 2>&1
 elif command -v iptables-save &>/dev/null; then
   mkdir -p /etc/iptables
   iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
@@ -695,4 +775,5 @@ echo "  Logs:     journalctl -u ${SERVICE_NAME} -f"
 echo ""
 echo "  Usage:"
 echo "    curl -H 'x-api-key: ${API_KEY}' http://localhost:${API_PORT}/servers"
+echo "    curl -H 'x-api-key: ${API_KEY}' http://localhost:${API_PORT}/lockdown/status"
 echo ""

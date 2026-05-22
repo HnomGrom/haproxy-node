@@ -20,12 +20,17 @@ export class ServersController {
 
   @Get()
   findAll() {
-    return this.serversService.findAll();
+    return this.serversService.findAllWithFlags();
   }
 
   @Post()
   create(@Body() dto: CreateServerDto) {
     return this.serversService.create(dto);
+  }
+
+  @Get(':id/health')
+  checkHealth(@Param('id', ParseIntPipe) id: number) {
+    return this.serversService.checkHealth(id);
   }
 
   @Delete(':id')

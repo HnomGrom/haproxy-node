@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "haproxy_node",
+  "project_id": "a460e16b-8588-4f19-8574-96e0f9794433"
+}

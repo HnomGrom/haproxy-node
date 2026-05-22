@@ -1,1 +1,38 @@
-
+{
+  "permissions": {
+    "allow": [
+      "Bash(bd create *)",
+      "Bash(bd list *)",
+      "Bash(kill 59867)",
+      "Bash(kill 64319)",
+      "Bash(kill -0 65759)",
+      "Bash(grep -E \"bd |bd$\")",
+      "Bash(bd config *)",
+      "Bash(bd dolt *)",
+      "Bash(/home/h3z1-mac/.local/bin/bd create *)",
+      "Bash(/home/h3z1-mac/.local/bin/bd dep *)",
+      "Bash(/home/h3z1-mac/.local/bin/bd list *)",
+      "Bash(grep -v \"Warning\\\\|Hints\\\\|HTTPS\\\\|SSH\\\\|GCM\\\\|Git output\\\\|ssh_\\\\|Host key\\\\|fatal\\\\|Please\\\\|and the\\\\|Original\\\\|^output\\\\|access rights\\\\|^- \\\\|^$\")",
+      "Bash(bd prime *)",
+      "Read(//root/.local/bin/**)",
+      "Read(//usr/local/bin/**)",
+      "Bash(find / -name 'bd' -type f -executable)",
+      "Bash(export PATH=\"/home/h3z1-mac/.local/bin:$PATH\")",
+      "Bash(bd ready *)",
+      "Bash(bd update *)",
+      "Bash(npm install *)",
+      "Bash(npx jest *)",
+      "Bash(bd close *)",
+      "Bash(bd stats *)",
+      "Bash(./node_modules/.bin/tsc -p tsconfig.build.json)",
+      "Bash(bash -n install.sh)",
+      "Bash(bash -n lockdown-check.sh)",
+      "Bash(bash -n xray-backend-lockdown.sh)",
+      "Bash(awk NR==30 {print NR\": [\"$0\"]\"} *)",
+      "Bash(/bin/sed -i 's/^  //' /home/h3z1-mac/projects/buzz/haproxy-node/attack-check.sh)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(git checkout *)",
+      "Bash(bash -n attack-check.sh)"
+    ]
+  }
+}

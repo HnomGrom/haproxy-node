@@ -103,6 +103,8 @@ export class HaproxyService {
     }
 
     for (const server of servers) {
+      // check inter 5s rise 1 fall 2: 10 сек до UP (вместо 60с при rise 2 inter 30s).
+      // Оператор не успевает подумать "не работает" пока backend поднимается.
       lines.push(
         '',
         `backend ${server.name}`,
