@@ -3,7 +3,10 @@ set -euo pipefail
 
 APP_DIR="/opt/haproxy-node"
 REPO_URL="https://github.com/HnomGrom/haproxy-node.git"
-REPO_BRANCH="main"
+# Ветка по умолчанию — main. Переопределяется env-переменной REPO_BRANCH
+# (для одноразовой установки с feature-ветки, например при тестировании):
+#   REPO_BRANCH=refactor/simplify-install bash install.sh
+REPO_BRANCH="${REPO_BRANCH:-main}"
 SERVICE_NAME="haproxy-node"
 NODE_MAJOR=22
 
