@@ -2,9 +2,11 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Server } from '../../generated/prisma/client';
 import { IptablesService } from '../iptables/iptables.service';
+import { CrowdsecService } from '../crowdsec/crowdsec.service';
 import { exec } from 'child_process';
 import { readFile, writeFile } from 'fs/promises';
 import { promisify } from 'util';
+import { cpus } from 'os';
 
 const execAsync = promisify(exec);
 
@@ -12,47 +14,92 @@ const execAsync = promisify(exec);
 export class HaproxyService {
   private readonly logger = new Logger(HaproxyService.name);
   private readonly configPath: string;
+  private readonly allowedSniList: string[];
 
   constructor(
     private readonly config: ConfigService,
     private readonly iptables: IptablesService,
+    private readonly crowdsec: CrowdsecService,
   ) {
-    // Joi-валидация в AppModule гарантирует наличие переменной (default '/etc/haproxy/haproxy.cfg').
-    this.configPath = this.config.get<string>('HAPROXY_CONFIG_PATH')!;
+    this.configPath = this.config.get<string>('HAPROXY_CONFIG_PATH');
+    const rawSni = this.config.get<string>('ALLOWED_SNI', '') || '';
+    this.allowedSniList = rawSni
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
   }
 
   buildConfig(servers: Server[]): string {
+    // HAProxy 2.8 (Ubuntu 24.04) не принимает 'nbthread auto' — нужно число
+    const nbThread = Math.max(1, Math.min(cpus().length, 64));
+
     const lines: string[] = [
       'global',
       '    log /dev/log local0',
-      '    maxconn 50000',
+      '    maxconn 200000',
+      `    nbthread ${nbThread}`,
+      '    stats socket /run/haproxy/admin.sock mode 660 level admin',
+      '    stats timeout 30s',
       '    daemon',
       '',
       'defaults',
       '    log global',
       '    mode tcp',
+      '    option tcplog',
+      '    option dontlognull',
+      '    option tcp-smart-accept',
+      '    option redispatch',
+      '    retries 3',
+      // timeout connect 5s — backend может тормозить под атакой, даём запас
       '    timeout connect 5s',
+      // client 1h — не рвём idle VLESS-клиентов
       '    timeout client  1h',
       '    timeout server  1h',
-      '    timeout tunnel  1h',
-      '    timeout client-fin 30s',
-      '    timeout server-fin 30s',
+      // tunnel 24h — долгие видео-стримы / игры через VLESS
+      '    timeout tunnel  24h',
+      '    timeout client-fin 10s',
+      '    timeout server-fin 10s',
+      // queue timeout — если все backend под нагрузкой, не держим клиента вечно
+      '    timeout queue   30s',
+      '',
+      '# Shared abuse-detection table (per source IP, across all frontends)',
+      'backend abuse_table',
+      '    stick-table type ipv6 size 1m expire 30m store conn_rate(10s),conn_cur,sess_rate(10s),gpc0,gpc0_rate(1m)',
     ];
 
+    const sniAcl =
+      this.allowedSniList.length > 0
+        ? `{ req.ssl_sni -i ${this.allowedSniList.join(' ')} }`
+        : null;
+
     for (const server of servers) {
-      lines.push(
+      const frontendLines = [
         '',
         `frontend ${server.name}_in`,
         `    bind *:${server.frontendPort}`,
         '    mode tcp',
-        // inspect-delay + reject if !TLS-hello: не-TLS-сканеры (типа masscan)
-        // получают reject, не съедают backend-коннект и не светят backend
-        // через 5-секундный hang. accept TLS-hello — сразу маршрутизация.
+        '    maxconn 50000',
+        '    tcp-request connection track-sc0 src table abuse_table',
+        '    tcp-request connection reject if { sc0_get_gpc0 gt 0 }',
+        // Более мягкие лимиты для VLESS mux и мобильных клиентов:
+        // VLESS-клиент с mux может открывать 10-20 параллельных TCP
+        '    tcp-request connection reject if { sc0_conn_rate gt 60 }',
+        '    tcp-request connection reject if { sc0_conn_cur gt 100 }',
+        // 5 секунд — достаточно для медленного 3G/4G TLS handshake
         '    tcp-request inspect-delay 5s',
         '    tcp-request content reject if !{ req.ssl_hello_type 1 }',
-        '    tcp-request content accept if { req.ssl_hello_type 1 }',
-        `    default_backend ${server.name}`,
-      );
+        '    tcp-request content sc-inc-gpc0(0) if !{ req.ssl_hello_type 1 }',
+      ];
+
+      if (sniAcl) {
+        frontendLines.push(
+          `    tcp-request content reject unless ${sniAcl}`,
+          `    tcp-request content sc-inc-gpc0(0) unless ${sniAcl}`,
+        );
+      }
+
+      frontendLines.push(`    default_backend ${server.name}`);
+      lines.push(...frontendLines);
     }
 
     for (const server of servers) {
@@ -62,7 +109,9 @@ export class HaproxyService {
         '',
         `backend ${server.name}`,
         '    mode tcp',
-        `    server s_${server.id} ${server.ip}:${server.backendPort} check inter 5s fall 2 rise 1`,
+        // inter 15s + fall 5 = backend DOWN только при 5 подряд сбоях (75 сек).
+        // rise 2 = быстрое возвращение к UP когда backend ожил.
+        `    server s_${server.id} ${server.ip}:${server.backendPort} check inter 15s fall 5 rise 2`,
       );
     }
 
@@ -105,6 +154,14 @@ export class HaproxyService {
         'iptables rules failed — HAProxy is running but fallback redirect is not active',
         error,
       );
+    }
+
+    // Sync CrowdSec backend whitelist — не критично, ошибки игнорируем
+    try {
+      const backendIps = servers.map((s) => s.ip);
+      await this.crowdsec.syncBackendWhitelist(backendIps);
+    } catch (error) {
+      this.logger.warn('CrowdSec whitelist sync failed (non-critical)', error);
     }
   }
 }

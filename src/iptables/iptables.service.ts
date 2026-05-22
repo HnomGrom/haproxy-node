@@ -7,12 +7,14 @@ const execAsync = promisify(exec);
 const LEGACY_CHAIN = 'HAPROXY_FALLBACK';
 
 /**
- * Legacy: ранее служба создавала NAT-цепочку HAPROXY_FALLBACK,
- * которая редиректила неизвестный трафик на fallback-порт. Это делало
- * HAProxy мишенью для сканеров.
+ * Legacy: ранее эта служба создавала NAT-цепочку HAPROXY_FALLBACK,
+ * которая редиректила весь неизвестный трафик на fallback-порт.
+ * Это создавало удобную цель для DDoS (атакующие бомбили случайные порты,
+ * NAT перенаправлял всё в HAProxy).
  *
- * Теперь неизвестные порты дропаются policy INPUT DROP (см. install.sh).
- * Служба только удаляет старую цепочку — для миграции с прошлых версий.
+ * Теперь служба только УБИРАЕТ старую цепочку (миграция) и ничего не создаёт.
+ * Неизвестный трафик дропается естественно на уровне ядра (RST от TCP стека,
+ * либо INPUT policy DROP если включён lockdown).
  */
 @Injectable()
 export class IptablesService implements OnModuleInit {
@@ -22,7 +24,7 @@ export class IptablesService implements OnModuleInit {
     await this.cleanup();
   }
 
-  // Вызывается из HaproxyService.applyConfig() — для совместимости. Ничего не создаёт.
+  // Вызывается из HaproxyService.applyConfig() — noop для обратной совместимости
   async applyRules(_serverPorts: number[]): Promise<void> {
     await this.cleanup();
   }
